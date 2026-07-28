@@ -1261,6 +1261,85 @@ def generate_portfolio_tips(scanned: pd.DataFrame, portfolio_symbols: set) -> li
     return tips[:3]
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_stability_metrics(symbol: str, period: str = "6mo") -> dict:
+    """Pobiera dane pod kątem STABILNOŚCI (a nie okazji/dołka): betę, roczną
+    zmienność historyczną (odchylenie std dziennych zwrotów, annualizowane)
+    oraz dynamikę przychodów/zysków. Osobny, dedykowany cache — używany
+    wyłącznie do sekcji 'Stabilne Top Picks', nie modyfikuje innych funkcji."""
+    result = {
+        "symbol": symbol, "beta": np.nan, "volatility_pct": np.nan,
+        "revenue_growth": np.nan, "earnings_growth": np.nan,
+    }
+    try:
+        ticker = yf.Ticker(symbol)
+        try:
+            info = ticker.info or {}
+        except Exception as exc:
+            logger.warning("ticker.info nie powiodło się dla %s (stability): %s", symbol, exc)
+            info = {}
+        result["beta"] = _safe_float(info.get("beta"))
+        result["revenue_growth"] = _safe_float(info.get("revenueGrowth"))
+        result["earnings_growth"] = _safe_float(info.get("earningsGrowth"))
+
+        hist = ticker.history(period=period, auto_adjust=True)
+        close = hist["Close"].dropna() if hist is not None and not hist.empty else pd.Series(dtype=float)
+        if len(close) > 5:
+            daily_returns = close.pct_change().dropna()
+            result["volatility_pct"] = float(daily_returns.std() * np.sqrt(252) * 100)
+    except Exception as exc:
+        logger.warning("Nie udało się pobrać metryk stabilności dla %s: %s", symbol, exc)
+    return result
+
+
+def compute_stability_score(beta: float, volatility_pct: float, dividend_yield: float, revenue_growth: float, earnings_growth: float) -> dict:
+    """Autorska Ocena Stabilności (1–10) — premiuje NISKĄ betę, NISKĄ
+    zmienność, regularną dywidendę i UMIARKOWANY, dodatni wzrost — czyli
+    profil 'wolniej, ale stabilniej', a nie głęboki dołek czy duży upside.
+    To narzędzie analityczno-edukacyjne, NIE stanowi rekomendacji inwestycyjnej."""
+    # Niska beta = wyższy wynik (beta 0.5 -> 10, beta 1.5 -> 0, beta 1.0 -> 5).
+    score_beta = 5.0 if (beta is None or (isinstance(beta, float) and math.isnan(beta))) else float(np.clip((1.5 - beta) / 1.0 * 10, 0.0, 10.0))
+    # Niska roczna zmienność = wyższy wynik (10% -> 10, 40% -> 0).
+    score_vol = 3.0 if (volatility_pct is None or (isinstance(volatility_pct, float) and math.isnan(volatility_pct))) else float(np.clip((40.0 - volatility_pct) / 30.0 * 10, 0.0, 10.0))
+    # Dywidenda 4%+ = pełny wynik.
+    score_div = 0.0 if (dividend_yield is None or (isinstance(dividend_yield, float) and math.isnan(dividend_yield))) else float(np.clip(dividend_yield * 100 / 4.0 * 10, 0.0, 10.0))
+    # Umiarkowany, dodatni wzrost przychodów/zysków (15%+ = pełny wynik; ujemny = 0).
+    growth_vals = [g for g in (revenue_growth, earnings_growth) if g is not None and not (isinstance(g, float) and math.isnan(g))]
+    score_growth = 0.0 if not growth_vals else float(np.clip(np.mean(growth_vals) * 100 / 15.0 * 10, 0.0, 10.0))
+
+    final = 0.30 * score_beta + 0.30 * score_vol + 0.20 * score_div + 0.20 * score_growth
+    final = float(np.clip(final, 1.0, 10.0))
+
+    reasons = []
+    if beta is not None and not (isinstance(beta, float) and math.isnan(beta)) and beta < 0.85:
+        reasons.append(f"niska beta ({beta:.2f})")
+    if volatility_pct is not None and not (isinstance(volatility_pct, float) and math.isnan(volatility_pct)) and volatility_pct < 25:
+        reasons.append(f"niska zmienność (~{volatility_pct:.0f}%/rok)")
+    if dividend_yield is not None and not (isinstance(dividend_yield, float) and math.isnan(dividend_yield)) and dividend_yield > 0.02:
+        reasons.append(f"stabilna dywidenda ({dividend_yield * 100:.1f}%)")
+    if growth_vals and np.mean(growth_vals) > 0:
+        reasons.append(f"regularny wzrost (~{np.mean(growth_vals) * 100:.0f}% r/r)")
+
+    if reasons:
+        rationale = "Stabilny profil: " + ", ".join(reasons[:3]) + "."
+    else:
+        rationale = "Umiarkowany profil ryzyka — brak wyraźnych sygnałów niskiej zmienności lub dywidendy."
+
+    return {"stability_score": round(final, 1), "stability_rationale": rationale}
+
+
+def compute_stability_status_labels(beta: float, volatility_pct: float, dividend_yield: float) -> str:
+    """Etykiety dla profilu 'stabilnego' — spadek/RSI tu nie mają znaczenia."""
+    labels = []
+    if beta is not None and not (isinstance(beta, float) and math.isnan(beta)) and beta < 0.8:
+        labels.append("Niska Beta (<0.8)")
+    if volatility_pct is not None and not (isinstance(volatility_pct, float) and math.isnan(volatility_pct)) and volatility_pct < 25:
+        labels.append("Niska zmienność (<25%/rok)")
+    if dividend_yield is not None and not (isinstance(dividend_yield, float) and math.isnan(dividend_yield)) and dividend_yield > 0.03:
+        labels.append("Stabilna dywidenda (>3%)")
+    return " | ".join(labels) if labels else "—"
+
+
 def render_gpw_scanner_tab(portfolio: pd.DataFrame) -> None:
     st.subheader("🔍 Skaner GPW (WIG20 & mWIG40)")
     st.caption(
@@ -1330,6 +1409,46 @@ def render_gpw_scanner_tab(portfolio: pd.DataFrame) -> None:
             profile = fetch_company_profile(row["symbol"])
             narrative = generate_company_narrative(profile, row["rationale"])
             st.caption(f"🗒️ {narrative}")
+
+    st.divider()
+    st.markdown("### 🛡️ Stabilne Top Picks (niższe ryzyko, pewniejszy wzrost)")
+    st.caption(
+        "Inny profil niż powyższe okazje: nie szukamy tu głębokiego dołka ani dużego upside, tylko spółek "
+        "z niższą betą, mniejszą zmiennością historyczną i bardziej regularnym, umiarkowanym wzrostem — "
+        "czyli 'wolniej, ale stabilniej'. To narzędzie analityczno-edukacyjne, NIE stanowi rekomendacji inwestycyjnej."
+    )
+
+    stability_rows = [fetch_stability_metrics(sym) for sym in valid["symbol"]]
+    stab_df = pd.DataFrame(stability_rows)
+    valid_stab = valid.merge(stab_df, on="symbol", how="left")
+
+    stab_scored = valid_stab.apply(
+        lambda r: compute_stability_score(
+            r.get("beta"), r.get("volatility_pct"), r.get("dividend_yield"), r.get("revenue_growth"), r.get("earnings_growth")
+        ),
+        axis=1, result_type="expand",
+    )
+    valid_stab = pd.concat([valid_stab.reset_index(drop=True), stab_scored.reset_index(drop=True)], axis=1)
+    valid_stab["stability_labels"] = valid_stab.apply(
+        lambda r: compute_stability_status_labels(r.get("beta"), r.get("volatility_pct"), r.get("dividend_yield")), axis=1
+    )
+    valid_stab = valid_stab.sort_values("stability_score", ascending=False).reset_index(drop=True)
+
+    stable_top5 = valid_stab.head(5)
+    stable_cols = st.columns(5)
+    for col, (_, row) in zip(stable_cols, stable_top5.iterrows()):
+        with col:
+            st.metric(row["symbol"], f"{row['stability_score']:.1f} / 10")
+            st.caption(row["stability_rationale"])
+            currency_suffix = f" {row.get('currency', '')}" if row.get("currency") else ""
+            price_txt = fmt_number(row.get("current_price"), 2, currency_suffix)
+            beta_txt = fmt_number(row.get("beta"), 2)
+            vol_txt = fmt_number(row.get("volatility_pct"), 1, "%")
+            div_txt = fmt_number(row.get("dividend_yield") * 100 if pd.notna(row.get("dividend_yield")) else np.nan, 1, "%")
+            st.write(f"**Cena obecna:** {price_txt}")
+            st.write(f"**Beta:** {beta_txt}  |  **Zmienność:** {vol_txt}")
+            st.write(f"**Stopa dywidendy:** {div_txt}")
+            st.caption(row["stability_labels"])
 
     st.divider()
     st.markdown("### 📋 Pełna Tabela Skanera")
