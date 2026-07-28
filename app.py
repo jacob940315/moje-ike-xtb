@@ -1039,6 +1039,210 @@ def render_projection_tab(portfolio: pd.DataFrame, total_value: float, cagr_pct:
 
 
 # ============================================================================
+# MODUŁ 6: SKANER GPW (WIG20 & mWIG40)
+# ============================================================================
+
+# Reprezentatywna baza tickerów GPW (WIG20 + mWIG40) w formacie Yahoo Finance
+# (sufiks .WA). Skład indeksów zmienia się okresowo — lista ma charakter
+# poglądowy i można ją swobodnie edytować / rozszerzać.
+GPW_SCANNER_TICKERS = [
+    # --- WIG20 ---
+    "PKN.WA", "PKO.WA", "PEO.WA", "PZU.WA", "KGH.WA",
+    "DNP.WA", "CDR.WA", "ALE.WA", "LPP.WA", "CPS.WA",
+    "SPL.WA", "MBK.WA", "OPL.WA", "PGE.WA", "TPE.WA",
+    "JSW.WA", "KRU.WA", "BDX.WA", "ALR.WA", "KTY.WA",
+    # --- mWIG40 ---
+    "CCC.WA", "DVL.WA", "ENA.WA", "MIL.WA", "TEN.WA",
+    "PLW.WA", "XTB.WA", "ATT.WA", "BFT.WA", "GPW.WA",
+    "AMC.WA", "NEU.WA", "APR.WA", "ACP.WA", "R22.WA",
+    "11B.WA", "COG.WA", "VRG.WA", "STS.WA", "PEP.WA",
+    "WPL.WA", "TXT.WA", "MRB.WA", "ABE.WA", "ASB.WA",
+    "GRX.WA", "PXM.WA", "MDG.WA", "ENT.WA", "ATC.WA",
+    "SNT.WA", "HUG.WA", "CIG.WA", "ELB.WA", "GEA.WA",
+    "OPN.WA", "PCO.WA", "ULM.WA", "WLT.WA", "ONE.WA",
+]
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_gpw_scanner_data(tickers: tuple, period: str = "1y") -> pd.DataFrame:
+    """Pobiera dane rynkowe (cena, RSI14, spadek od szczytu 52W, docelowa
+    cena analityków) dla listy tickerów GPW, wykorzystując tę samą funkcję
+    `fetch_market_data`, co reszta aplikacji (jeden spójny cache)."""
+    rows = []
+    for sym in tickers:
+        data = fetch_market_data(sym, period=period)
+        rows.append(data)
+    df = pd.DataFrame(rows)
+
+    df["drawdown_pct"] = np.where(
+        (df["week52_high"].notna()) & (df["week52_high"] > 0) & (df["current_price"].notna()),
+        (df["week52_high"] - df["current_price"]) / df["week52_high"] * 100,
+        np.nan,
+    )
+    df["upside_pct"] = np.where(
+        (df["target_mean"].notna()) & (df["current_price"].notna()) & (df["current_price"] > 0),
+        (df["target_mean"] - df["current_price"]) / df["current_price"] * 100,
+        np.nan,
+    )
+    # Konsensus analityków jest zwyczajowo szacowany na horyzont ~12 miesięcy.
+    # Cel 6-miesięczny to uproszczona interpolacja liniowa w połowie drogi —
+    # ma charakter wyłącznie poglądowy, nie jest osobną prognozą.
+    df["target_12m_pct"] = df["upside_pct"]
+    df["target_6m_pct"] = df["upside_pct"] * 0.5
+    df["target_12m_price"] = df["target_mean"]
+    df["target_6m_price"] = np.where(
+        df["current_price"].notna() & df["target_mean"].notna(),
+        df["current_price"] + (df["target_mean"] - df["current_price"]) * 0.5,
+        np.nan,
+    )
+    return df
+
+
+def compute_scanner_score(rsi: float, drawdown_pct: float, upside_pct: float) -> dict:
+    """Autorska, zagregowana Ocena Końcowa (1–10) skanera GPW, oparta o trzy
+    składowe: wyprzedanie RSI, głębokość spadku od szczytu 52W oraz potencjał
+    wzrostu wg średniej ceny docelowej analityków. To narzędzie analityczno-
+    -edukacyjne, NIE stanowi rekomendacji inwestycyjnej."""
+    # Składowa RSI: im niższe RSI (wyprzedanie), tym wyższy wynik.
+    score_rsi = 5.0 if (rsi is None or (isinstance(rsi, float) and math.isnan(rsi))) else float(np.clip((80.0 - rsi) / 6.0, 0.0, 10.0))
+    # Składowa spadku od szczytu: głębszy dołek = wyższy wynik (do granicy 50%).
+    score_drawdown = 0.0 if (drawdown_pct is None or (isinstance(drawdown_pct, float) and math.isnan(drawdown_pct))) else float(np.clip(drawdown_pct / 5.0, 0.0, 10.0))
+    # Składowa potencjału: wyższy szacowany upside wg analityków = wyższy wynik (do granicy 50%).
+    score_upside = 0.0 if (upside_pct is None or (isinstance(upside_pct, float) and math.isnan(upside_pct))) else float(np.clip(upside_pct / 5.0, 0.0, 10.0))
+
+    final = 0.40 * score_upside + 0.35 * score_rsi + 0.25 * score_drawdown
+    final = float(np.clip(final, 1.0, 10.0))
+
+    reasons = []
+    if not math.isnan(rsi) if rsi is not None else False:
+        if rsi < 30:
+            reasons.append(f"silne wyprzedanie (RSI {rsi:.0f} < 30)")
+        elif rsi < 40:
+            reasons.append(f"umiarkowane wyprzedanie (RSI {rsi:.0f})")
+    if drawdown_pct is not None and not (isinstance(drawdown_pct, float) and math.isnan(drawdown_pct)):
+        if drawdown_pct > 25:
+            reasons.append(f"głęboki dołek {drawdown_pct:.0f}% od szczytu 52W")
+        elif drawdown_pct > 10:
+            reasons.append(f"korekta {drawdown_pct:.0f}% od szczytu 52W")
+    if upside_pct is not None and not (isinstance(upside_pct, float) and math.isnan(upside_pct)):
+        if upside_pct > 25:
+            reasons.append(f"{upside_pct:.0f}% potencjału wg analityków")
+        elif upside_pct > 10:
+            reasons.append(f"{upside_pct:.0f}% szacowanego potencjału")
+
+    if reasons:
+        rationale = "Silny sygnał: " + " połączone z ".join(reasons[:2]) + "." if len(reasons) > 1 else reasons[0].capitalize() + "."
+    else:
+        rationale = "Brak wyraźnych sygnałów — spółka blisko neutralnych poziomów wskaźników."
+
+    return {"score": round(final, 1), "rationale": rationale}
+
+
+def compute_scanner_status_labels(rsi: float, drawdown_pct: float, upside_pct: float) -> str:
+    """Buduje listę etykiet/statusów dla wiersza tabeli skanera GPW."""
+    labels = []
+    if rsi is not None and not (isinstance(rsi, float) and math.isnan(rsi)) and rsi < 30:
+        labels.append("Mocne Wyprzedanie (RSI < 30)")
+    if upside_pct is not None and not (isinstance(upside_pct, float) and math.isnan(upside_pct)) and upside_pct > 25:
+        labels.append("Duży potencjał (>25%)")
+    if drawdown_pct is not None and not (isinstance(drawdown_pct, float) and math.isnan(drawdown_pct)) and drawdown_pct > 25:
+        labels.append("Głęboki dołek od szczytu")
+    return " | ".join(labels) if labels else "—"
+
+
+def render_gpw_scanner_tab() -> None:
+    st.subheader("🔍 Skaner GPW (WIG20 & mWIG40)")
+    st.caption(
+        "Automatyczny skan ok. 60 spółek z WIG20 i mWIG40 wg RSI(14), spadku od szczytu 52-tygodniowego "
+        "oraz prognoz analityków (yfinance). Narzędzie ma charakter analityczno-edukacyjny i NIE stanowi "
+        "porady ani rekomendacji inwestycyjnej."
+    )
+
+    col_a, col_b = st.columns([3, 1])
+    with col_a:
+        st.info(f"Analizowana baza: {len(GPW_SCANNER_TICKERS)} spółek (WIG20 + mWIG40).")
+    with col_b:
+        if st.button("🔄 Odśwież skaner GPW"):
+            fetch_gpw_scanner_data.clear()
+            st.success("Cache skanera wyczyszczony.")
+
+    progress = st.progress(0.0, text="Skanowanie GPW...")
+    # fetch_market_data jest cache'owane per-ticker (@st.cache_data), więc
+    # pasek postępu ma charakter informacyjny — realne wywołania sieciowe
+    # następują tylko dla tickerów spoza cache.
+    scan_df = fetch_gpw_scanner_data(tuple(GPW_SCANNER_TICKERS))
+    progress.progress(1.0, text="Gotowe.")
+    progress.empty()
+
+    valid = scan_df[scan_df["current_price"].notna()].copy()
+    failed = scan_df[scan_df["current_price"].isna()]
+
+    if valid.empty:
+        st.error("Nie udało się pobrać danych dla żadnej spółki z listy skanera.")
+        return
+
+    scored = valid.apply(
+        lambda r: compute_scanner_score(r.get("rsi14"), r.get("drawdown_pct"), r.get("upside_pct")), axis=1, result_type="expand"
+    )
+    valid = pd.concat([valid.reset_index(drop=True), scored.reset_index(drop=True)], axis=1)
+    valid["status_labels"] = valid.apply(
+        lambda r: compute_scanner_status_labels(r.get("rsi14"), r.get("drawdown_pct"), r.get("upside_pct")), axis=1
+    )
+    valid = valid.sort_values("score", ascending=False).reset_index(drop=True)
+
+    if not failed.empty:
+        with st.expander(f"⚠️ Brak danych dla {len(failed)} spółek"):
+            st.write(", ".join(failed["symbol"].tolist()))
+
+    st.markdown("### 🔥 TOP 5 Najlepszych Okazji")
+    top5 = valid.head(5)
+    top_cols = st.columns(5)
+    for col, (_, row) in zip(top_cols, top5.iterrows()):
+        with col:
+            st.metric(row["symbol"], f"{row['score']:.1f} / 10")
+            st.caption(row["rationale"])
+            currency_suffix = f" {row.get('currency', '')}" if row.get("currency") else ""
+            price_txt = fmt_number(row.get("current_price"), 2, currency_suffix)
+            target6_txt = fmt_number(row.get("target_6m_price"), 2)
+            pct6_txt = fmt_number(row.get("target_6m_pct"), 1, "%")
+            target12_txt = fmt_number(row.get("target_12m_price"), 2)
+            pct12_txt = fmt_number(row.get("target_12m_pct"), 1, "%")
+            st.write(f"**Cena obecna:** {price_txt}")
+            st.write(f"**Target 6M:** {target6_txt} ({pct6_txt})")
+            st.write(f"**Target 12M:** {target12_txt} ({pct12_txt})")
+
+    st.divider()
+    st.markdown("### 📋 Pełna Tabela Skanera")
+    display = valid.rename(
+        columns={
+            "symbol": "Ticker", "current_price": "Cena", "rsi14": "RSI(14)",
+            "drawdown_pct": "Spadek od szczytu 52W %", "target_mean": "Śr. cena docelowa",
+            "upside_pct": "Potencjał %", "target_6m_price": "Target 6M", "target_6m_pct": "Potencjał 6M %",
+            "target_12m_price": "Target 12M", "target_12m_pct": "Potencjał 12M %",
+            "score": "Ocena Końcowa", "status_labels": "Statusy", "sector": "Sektor",
+        }
+    )
+    cols = [
+        "Ticker", "Ocena Końcowa", "Cena", "RSI(14)", "Spadek od szczytu 52W %",
+        "Śr. cena docelowa", "Potencjał %", "Target 6M", "Potencjał 6M %",
+        "Target 12M", "Potencjał 12M %", "Statusy", "Sektor",
+    ]
+    st.dataframe(
+        display[cols].style.format(
+            {
+                "Ocena Końcowa": "{:.1f}", "Cena": "{:.2f}", "RSI(14)": "{:.1f}",
+                "Spadek od szczytu 52W %": "{:.1f}%", "Śr. cena docelowa": "{:.2f}",
+                "Potencjał %": "{:.1f}%", "Target 6M": "{:.2f}", "Potencjał 6M %": "{:.1f}%",
+                "Target 12M": "{:.2f}", "Potencjał 12M %": "{:.1f}%",
+            },
+            na_rep="—",
+        ),
+        use_container_width=True,
+        height=600,
+    )
+
+
+# ============================================================================
 # GŁÓWNA APLIKACJA
 # ============================================================================
 
@@ -1128,13 +1332,14 @@ def main() -> None:
 
     render_kpi_row(total_value, total_invested, total_profit, total_profit_pct, belka_saved, ike_contributed_this_year, ike_limit)
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         [
             "📊 Przegląd Portfela & Ceny na żywo",
             "🎯 Prognozy Analityków (6-12M)",
             "📉 Okazje \"Buy The Dip\"",
             "⚖️ Kalkulator Rebalansu",
             "💰 Projekcja IKE & Dywidendy",
+            "🔍 Skaner GPW (WIG20 & mWIG40)",
         ]
     )
     with tab1:
@@ -1147,6 +1352,8 @@ def main() -> None:
         render_rebalance_tab(portfolio)
     with tab5:
         render_projection_tab(portfolio, total_value, cagr_pct, ike_limit)
+    with tab6:
+        render_gpw_scanner_tab()
 
 
 if __name__ == "__main__":
