@@ -4,3 +4,5 @@ numpy
 plotly>=5.20
 yfinance>=0.2.40
 pandas-ta>=0.3.14b0
+openpyxl>=3.1
+
