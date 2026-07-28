@@ -1182,6 +1182,25 @@ _RECOMMENDATION_PL = {
     "sell": "rekomendują sprzedaż",
 }
 
+_RECOMMENDATION_LABEL_PL = {
+    "strong_buy": "Zdecydowanie kupuj",
+    "buy": "Kupuj",
+    "hold": "Trzymaj",
+    "underperform": "Sprzedawaj (słabiej niż rynek)",
+    "sell": "Sprzedawaj",
+}
+
+
+def format_recommendation_text(recommendation: str, num_analysts) -> str:
+    """Formatuje jawną, jednoznaczną etykietę rekomendacji analityków do
+    wyświetlenia przy KAŻDYM top picku (obok autorskiego komentarza)."""
+    if not recommendation or recommendation not in _RECOMMENDATION_LABEL_PL:
+        return "Brak danych"
+    label = _RECOMMENDATION_LABEL_PL[recommendation]
+    if num_analysts is not None and not (isinstance(num_analysts, float) and math.isnan(num_analysts)) and num_analysts > 0:
+        return f"{label} ({int(num_analysts)} analityków)"
+    return label
+
 
 def generate_company_narrative(profile: dict, quant_rationale: str) -> str:
     """Buduje autorski komentarz opisowy do jednej z TOP 5 okazji — łączy
@@ -1351,6 +1370,7 @@ def render_gpw_scanner_tab(portfolio: pd.DataFrame) -> None:
     col_a, col_b = st.columns([3, 1])
     with col_a:
         st.info(f"Analizowana baza: {len(GPW_SCANNER_TICKERS)} spółek (WIG20 + mWIG40).")
+        st.caption("Pierwsze uruchomienie może potrwać dłużej — pobierane są też pełne nazwy spółek i rekomendacje analityków (dane cache'owane na 1h).")
     with col_b:
         if st.button("🔄 Odśwież skaner GPW"):
             fetch_gpw_scanner_data.clear()
@@ -1380,6 +1400,14 @@ def render_gpw_scanner_tab(portfolio: pd.DataFrame) -> None:
     )
     valid = valid.sort_values("score", ascending=False).reset_index(drop=True)
 
+    # Pełne nazwy spółek + rekomendacje analityków — pobierane raz dla całej
+    # zeskanowanej bazy, żeby móc je pokazać zarówno w TOP 5 Okazji, jak i w
+    # Stabilnych Top Pickach oraz w pełnej tabeli (zamiast samych tickerów).
+    profile_rows = [fetch_company_profile(sym) for sym in valid["symbol"]]
+    profile_df = pd.DataFrame(profile_rows).drop(columns=["sector"], errors="ignore")
+    valid = valid.merge(profile_df, on="symbol", how="left")
+    valid["long_name"] = valid["long_name"].fillna(valid["symbol"])
+
     if not failed.empty:
         with st.expander(f"⚠️ Brak danych dla {len(failed)} spółek"):
             st.write(", ".join(failed["symbol"].tolist()))
@@ -1395,7 +1423,8 @@ def render_gpw_scanner_tab(portfolio: pd.DataFrame) -> None:
     top_cols = st.columns(5)
     for col, (_, row) in zip(top_cols, top5.iterrows()):
         with col:
-            st.metric(row["symbol"], f"{row['score']:.1f} / 10")
+            st.metric(row["long_name"], f"{row['score']:.1f} / 10")
+            st.caption(f"Ticker: {row['symbol']}")
             st.caption(row["rationale"])
             currency_suffix = f" {row.get('currency', '')}" if row.get("currency") else ""
             price_txt = fmt_number(row.get("current_price"), 2, currency_suffix)
@@ -1406,7 +1435,13 @@ def render_gpw_scanner_tab(portfolio: pd.DataFrame) -> None:
             st.write(f"**Cena obecna:** {price_txt}")
             st.write(f"**Target 6M:** {target6_txt} ({pct6_txt})")
             st.write(f"**Target 12M:** {target12_txt} ({pct12_txt})")
-            profile = fetch_company_profile(row["symbol"])
+            rec_txt = format_recommendation_text(row.get("recommendation"), row.get("num_analysts"))
+            st.write(f"**Rekomendacja analityków:** {rec_txt}")
+            profile = {
+                "sector": row.get("sector"), "industry": row.get("industry"),
+                "revenue_growth": row.get("revenue_growth"), "earnings_growth": row.get("earnings_growth"),
+                "recommendation": row.get("recommendation"), "num_analysts": row.get("num_analysts"),
+            }
             narrative = generate_company_narrative(profile, row["rationale"])
             st.caption(f"🗒️ {narrative}")
 
@@ -1419,7 +1454,7 @@ def render_gpw_scanner_tab(portfolio: pd.DataFrame) -> None:
     )
 
     stability_rows = [fetch_stability_metrics(sym) for sym in valid["symbol"]]
-    stab_df = pd.DataFrame(stability_rows)
+    stab_df = pd.DataFrame(stability_rows).drop(columns=["revenue_growth", "earnings_growth"], errors="ignore")
     valid_stab = valid.merge(stab_df, on="symbol", how="left")
 
     stab_scored = valid_stab.apply(
@@ -1438,23 +1473,32 @@ def render_gpw_scanner_tab(portfolio: pd.DataFrame) -> None:
     stable_cols = st.columns(5)
     for col, (_, row) in zip(stable_cols, stable_top5.iterrows()):
         with col:
-            st.metric(row["symbol"], f"{row['stability_score']:.1f} / 10")
+            st.metric(row["long_name"], f"{row['stability_score']:.1f} / 10")
+            st.caption(f"Ticker: {row['symbol']}")
             st.caption(row["stability_rationale"])
             currency_suffix = f" {row.get('currency', '')}" if row.get("currency") else ""
             price_txt = fmt_number(row.get("current_price"), 2, currency_suffix)
             beta_txt = fmt_number(row.get("beta"), 2)
             vol_txt = fmt_number(row.get("volatility_pct"), 1, "%")
             div_txt = fmt_number(row.get("dividend_yield") * 100 if pd.notna(row.get("dividend_yield")) else np.nan, 1, "%")
+            target6_txt = fmt_number(row.get("target_6m_price"), 2)
+            pct6_txt = fmt_number(row.get("target_6m_pct"), 1, "%")
+            target12_txt = fmt_number(row.get("target_12m_price"), 2)
+            pct12_txt = fmt_number(row.get("target_12m_pct"), 1, "%")
             st.write(f"**Cena obecna:** {price_txt}")
             st.write(f"**Beta:** {beta_txt}  |  **Zmienność:** {vol_txt}")
             st.write(f"**Stopa dywidendy:** {div_txt}")
+            st.write(f"**Target 6M:** {target6_txt} ({pct6_txt})")
+            st.write(f"**Target 12M:** {target12_txt} ({pct12_txt})")
+            rec_txt = format_recommendation_text(row.get("recommendation"), row.get("num_analysts"))
+            st.write(f"**Rekomendacja analityków:** {rec_txt}")
             st.caption(row["stability_labels"])
 
     st.divider()
     st.markdown("### 📋 Pełna Tabela Skanera")
     display = valid.rename(
         columns={
-            "symbol": "Ticker", "current_price": "Cena", "rsi14": "RSI(14)",
+            "symbol": "Ticker", "long_name": "Nazwa", "current_price": "Cena", "rsi14": "RSI(14)",
             "drawdown_pct": "Spadek od szczytu 52W %", "target_mean": "Śr. cena docelowa",
             "upside_pct": "Potencjał %", "target_6m_price": "Target 6M", "target_6m_pct": "Potencjał 6M %",
             "target_12m_price": "Target 12M", "target_12m_pct": "Potencjał 12M %",
@@ -1462,7 +1506,7 @@ def render_gpw_scanner_tab(portfolio: pd.DataFrame) -> None:
         }
     )
     cols = [
-        "Ticker", "Ocena Końcowa", "Cena", "RSI(14)", "Spadek od szczytu 52W %",
+        "Ticker", "Nazwa", "Ocena Końcowa", "Cena", "RSI(14)", "Spadek od szczytu 52W %",
         "Śr. cena docelowa", "Potencjał %", "Target 6M", "Potencjał 6M %",
         "Target 12M", "Potencjał 12M %", "Statusy", "Sektor",
     ]
