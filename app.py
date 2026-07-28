@@ -18,6 +18,7 @@ from __future__ import annotations
 import io
 import math
 import logging
+import re
 import unicodedata
 from datetime import datetime
 from typing import Optional
@@ -77,16 +78,14 @@ PRICE_COLS = ["cena otwarcia", "open price", "cena zakupu", "price", "cena"]
 AMOUNT_COLS = ["kwota", "wartosc", "amount", "purchase value", "total"]
 DATE_COLS = ["data otwarcia", "open time", "czas otwarcia", "data", "date"]
 
-# Dodatkowe kolumny "nogi zamykającej" pozycji w arkuszu "Closed Positions"
-# (cena/kwota/data zamknięcia pozycji odpowiadają sprzedaży).
-CLOSE_PRICE_COLS = ["close price", "cena zamkniecia"]
-SALE_VALUE_COLS = ["sale value", "wartosc sprzedazy"]
-CLOSE_DATE_COLS = ["close time", "czas zamkniecia", "data zamkniecia"]
-
 # Arkusze eksportu historii rachunku XTB, po jakich fragmentach nazwy (po
 # normalizacji) je rozpoznajemy.
-OPEN_POSITIONS_SHEET_KEYWORDS = ["open", "position"]
-CLOSED_POSITIONS_SHEET_KEYWORDS = ["closed", "position"]
+CASH_OPERATIONS_SHEET_KEYWORDS = ["cash", "operations"]
+CASH_OPERATIONS_SHEET_KEYWORDS = ["cash", "operations"]
+
+# Dodatkowe aliasy kolumn potrzebne wyłącznie w arkuszu "Cash Operations".
+COMMENT_COLS = ["comment", "komentarz"]
+CASH_TIME_COLS = ["time", "data", "date"]
 
 # Słowa kluczowe używane do zlokalizowania wiersza nagłówka tabeli wewnątrz
 # arkusza XLSX (przed właściwą tabelą XTB umieszcza kilka wierszy metadanych
@@ -94,6 +93,14 @@ CLOSED_POSITIONS_SHEET_KEYWORDS = ["closed", "position"]
 HEADER_ROW_KEYWORDS = ["ticker", "instrument", "symbol"]
 
 SELL_KEYWORDS = ["sell", "sprzedaz"]
+
+# "Cash Operations" nie zawiera osobnych kolumn Wolumen/Cena — trzeba je
+# wyłuskać z pola Comment, np. "OPEN BUY 4 @ 78.010" lub, przy częściowym
+# zamknięciu pozycji, "CLOSE BUY 3/4 @ 659.00" (wolumen = licznik ułamka).
+TRANSACTION_COMMENT_RE = re.compile(
+    r"(open|close)\s+(buy|sell)\s+([\d]+(?:[.,]\d+)?)(?:\s*/\s*[\d]+(?:[.,]\d+)?)?\s*@\s*([\d]+(?:[.,]\d+)?)",
+    re.IGNORECASE,
+)
 
 # Mapowanie sufiksów giełd XTB -> sufiksów używanych przez Yahoo Finance.
 # "" oznacza brak sufiksu (np. akcje US: AAPL.US -> AAPL).
@@ -329,108 +336,109 @@ def map_xtb_symbol_to_yahoo(xtb_symbol: str) -> str:
     return symbol
 
 
+def _parse_transaction_comment(comment) -> Optional[tuple]:
+    """Wyłuskuje z pola 'Comment' arkusza Cash Operations informacje o
+    transakcji, np. 'OPEN BUY 4 @ 78.010' -> ('open', 4.0, 78.010) lub
+    'CLOSE BUY 3/4 @ 659.00' -> ('close', 3.0, 659.00) — przy częściowym
+    zamknięciu pozycji liczy się tylko licznik ułamka (wolumen tej
+    konkretnej transakcji zamknięcia)."""
+    if not isinstance(comment, str):
+        return None
+    match = TRANSACTION_COMMENT_RE.search(comment)
+    if not match:
+        return None
+    action = match.group(1).lower()
+    try:
+        volume = float(match.group(3).replace(",", "."))
+        price = float(match.group(4).replace(",", "."))
+    except ValueError:
+        return None
+    return action, volume, price
+
+
+def _parse_cash_operations(df: pd.DataFrame) -> pd.DataFrame:
+    """Buduje znormalizowaną tabelę transakcji z arkusza 'Cash Operations',
+    który zawiera KAŻDĄ pojedynczą operację na koncie (zakupy, sprzedaże,
+    dywidendy, wpłaty, odsetki...). Filtrujemy tylko wiersze będące realnymi
+    transakcjami giełdowymi ('Stock purchase' / 'Stock sell'), a wolumen i
+    cenę odczytujemy z pola Comment, bo arkusz nie ma osobnych kolumn na te
+    wartości."""
+    col_type = find_column(df.columns, TYPE_COLS)
+    col_symbol = find_column(df.columns, SYMBOL_COLS)
+    col_amount = find_column(df.columns, AMOUNT_COLS)
+    col_comment = find_column(df.columns, COMMENT_COLS)
+    col_date = find_column(df.columns, CASH_TIME_COLS)
+
+    if col_type is None or col_symbol is None or col_comment is None:
+        return pd.DataFrame()
+
+    work = pd.DataFrame()
+    work["type_raw"] = df[col_type].astype(str)
+    work["symbol_xtb"] = df[col_symbol].astype(str).str.strip()
+    work["amount_raw"] = pd.to_numeric(df[col_amount], errors="coerce") if col_amount else np.nan
+    work["comment"] = df[col_comment].astype(str) if col_comment else ""
+    work["date"] = pd.to_datetime(df[col_date], errors="coerce") if col_date else pd.NaT
+
+    # Zostają wyłącznie wiersze opisujące transakcje giełdowe (kupno/sprzedaż
+    # akcji/ETF) — odrzucamy dywidendy, wpłaty, odsetki od wolnych środków itp.
+    type_norm = work["type_raw"].apply(_normalize)
+    is_stock_row = type_norm.str.contains("stock") & (
+        type_norm.str.contains("purchase") | type_norm.str.contains("sell") | type_norm.str.contains("sprzedaz")
+    )
+    work = work[is_stock_row & (work["symbol_xtb"].str.len() > 0)]
+    work = work[~work["symbol_xtb"].str.lower().isin(["nan", "none", ""])]
+
+    parsed = work["comment"].apply(_parse_transaction_comment)
+    work = work[parsed.notna()].copy()
+    if work.empty:
+        return pd.DataFrame()
+    parsed = parsed[parsed.notna()]
+
+    work["action"] = parsed.apply(lambda p: p[0])
+    work["volume"] = parsed.apply(lambda p: p[1])
+    work["price"] = parsed.apply(lambda p: p[2])
+    work["amount"] = work["amount_raw"].abs()
+    missing_amount = work["amount"].isna()
+    work.loc[missing_amount, "amount"] = work.loc[missing_amount, "volume"] * work.loc[missing_amount, "price"]
+    # "OPEN" = wejście w pozycję (kupno), "CLOSE" = wyjście z pozycji
+    # (sprzedaż) — niezależnie od słowa BUY/SELL w komentarzu, bo ono opisuje
+    # kierunek pierwotnej pozycji, a nie tej konkretnej operacji.
+    work["type"] = np.where(work["action"] == "open", "BUY", "SELL")
+
+    return work[["symbol_xtb", "volume", "price", "amount", "type", "date"]].reset_index(drop=True)
+
+
 @st.cache_data(show_spinner=False)
 def parse_xtb_xlsx(file_bytes: bytes) -> pd.DataFrame:
-    """Parsuje eksport XLSX historii rachunku z XTB (arkusze 'Open Positions'
-    i/lub 'Closed Positions') do znormalizowanej tabeli transakcji.
-
-    Pozycje wciąż otwarte (arkusz 'Open Positions') trafiają jako pojedyncza
-    "noga" BUY — budują aktualny, otwarty wolumen. Pozycje już zamknięte
-    (arkusz 'Closed Positions') trafiają jako para nóg BUY+SELL o tym samym
-    wolumenie — dzięki temu w agregacji (`aggregate_positions`) netują się do
-    zera i poprawnie NIE wchodzą do aktualnego portfela, mimo że opisują
-    transakcje historyczne."""
+    """Parsuje eksport XLSX historii rachunku z XTB do znormalizowanej tabeli
+    transakcji, korzystając z arkusza 'Cash Operations' — zawiera on komplet
+    pojedynczych transakcji (i zakupy, i sprzedaże), z czego po zagregowaniu
+    (`aggregate_positions`) wynika aktualny, otwarty portfel."""
     try:
         xls = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
     except Exception as exc:
         raise ValueError(f"Nie udało się odczytać pliku XLSX ({exc}). Sprawdź, czy to poprawny eksport z XTB.")
 
     sheet_map = {_normalize(name): name for name in xls.sheet_names}
-    open_sheet = _find_sheet(sheet_map, OPEN_POSITIONS_SHEET_KEYWORDS)
-    closed_sheet = _find_sheet(sheet_map, CLOSED_POSITIONS_SHEET_KEYWORDS)
+    cash_sheet = _find_sheet(sheet_map, CASH_OPERATIONS_SHEET_KEYWORDS)
 
-    if open_sheet is None and closed_sheet is None:
+    if cash_sheet is None:
         raise ValueError(
-            "Nie znaleziono arkuszy 'Open Positions' ani 'Closed Positions' w pliku. "
+            "Nie znaleziono arkusza 'Cash Operations' w pliku. "
             "Sprawdź, czy to poprawny eksport historii rachunku z XTB "
             "(w platformie XTB: Historia rachunku -> Eksport -> XLSX)."
         )
 
-    frames: list[pd.DataFrame] = []
+    df = _read_sheet_table(xls, cash_sheet)
+    if df is None or df.empty:
+        raise ValueError("Arkusz 'Cash Operations' jest pusty lub nie udało się odczytać jego nagłówka.")
 
-    if open_sheet is not None:
-        df = _read_sheet_table(xls, open_sheet)
-        if df is not None and not df.empty:
-            col_symbol = find_column(df.columns, SYMBOL_COLS)
-            if col_symbol is not None:
-                col_volume = find_column(df.columns, VOLUME_COLS)
-                col_price = find_column(df.columns, PRICE_COLS)
-                col_amount = find_column(df.columns, AMOUNT_COLS)
-                col_date = find_column(df.columns, DATE_COLS)
-
-                leg = pd.DataFrame()
-                leg["symbol_xtb"] = df[col_symbol].astype(str).str.strip()
-                leg["volume"] = pd.to_numeric(df[col_volume], errors="coerce") if col_volume else np.nan
-                leg["price"] = pd.to_numeric(df[col_price], errors="coerce") if col_price else np.nan
-                leg["amount"] = pd.to_numeric(df[col_amount], errors="coerce").abs() if col_amount else np.nan
-                leg["type"] = "BUY"
-                leg["date"] = pd.to_datetime(df[col_date], errors="coerce") if col_date else pd.NaT
-                frames.append(leg)
-
-    if closed_sheet is not None:
-        df = _read_sheet_table(xls, closed_sheet)
-        if df is not None and not df.empty:
-            col_symbol = find_column(df.columns, SYMBOL_COLS)
-            if col_symbol is not None:
-                col_volume = find_column(df.columns, VOLUME_COLS)
-                col_open_price = find_column(df.columns, PRICE_COLS)
-                col_close_price = find_column(df.columns, CLOSE_PRICE_COLS)
-                col_purchase_value = find_column(df.columns, AMOUNT_COLS)
-                col_sale_value = find_column(df.columns, SALE_VALUE_COLS)
-                col_open_date = find_column(df.columns, DATE_COLS)
-                col_close_date = find_column(df.columns, CLOSE_DATE_COLS)
-
-                symbol = df[col_symbol].astype(str).str.strip()
-                volume = pd.to_numeric(df[col_volume], errors="coerce") if col_volume else np.nan
-
-                buy_leg = pd.DataFrame()
-                buy_leg["symbol_xtb"] = symbol
-                buy_leg["volume"] = volume
-                buy_leg["price"] = pd.to_numeric(df[col_open_price], errors="coerce") if col_open_price else np.nan
-                buy_leg["amount"] = (
-                    pd.to_numeric(df[col_purchase_value], errors="coerce").abs() if col_purchase_value else np.nan
-                )
-                buy_leg["type"] = "BUY"
-                buy_leg["date"] = pd.to_datetime(df[col_open_date], errors="coerce") if col_open_date else pd.NaT
-
-                sell_leg = pd.DataFrame()
-                sell_leg["symbol_xtb"] = symbol
-                sell_leg["volume"] = volume
-                sell_leg["price"] = pd.to_numeric(df[col_close_price], errors="coerce") if col_close_price else np.nan
-                sell_leg["amount"] = (
-                    pd.to_numeric(df[col_sale_value], errors="coerce").abs() if col_sale_value else np.nan
-                )
-                sell_leg["type"] = "SELL"
-                sell_leg["date"] = pd.to_datetime(df[col_close_date], errors="coerce") if col_close_date else pd.NaT
-
-                frames.append(buy_leg)
-                frames.append(sell_leg)
-
-    if not frames:
+    clean = _parse_cash_operations(df)
+    if clean.empty:
         raise ValueError(
-            "Nie znaleziono żadnych transakcji w arkuszach 'Open Positions' / 'Closed Positions'. "
-            "Sprawdź strukturę pliku XLSX."
+            "Nie znaleziono żadnych transakcji giełdowych ('Stock purchase' / 'Stock sell') "
+            "w arkuszu 'Cash Operations'. Sprawdź strukturę pliku XLSX."
         )
-
-    clean = pd.concat(frames, ignore_index=True)
-
-    # Odrzuć wiersze bez sensownego symbolu (np. puste linie podsumowania)
-    clean = clean[clean["symbol_xtb"].str.len() > 0]
-    clean = clean[~clean["symbol_xtb"].str.lower().isin(["nan", "none", ""])]
-
-    # Dolicz brakującą kwotę transakcji jako wolumen * cena
-    mask = clean["amount"].isna() & clean["volume"].notna() & clean["price"].notna()
-    clean.loc[mask, "amount"] = clean.loc[mask, "volume"] * clean.loc[mask, "price"]
 
     clean["type_norm"] = clean["type"].apply(_normalize)
     clean["is_sell"] = clean["type_norm"].apply(lambda t: any(k in t for k in SELL_KEYWORDS))
