@@ -449,7 +449,8 @@ def parse_xtb_xlsx(file_bytes: bytes) -> pd.DataFrame:
 
 def aggregate_positions(clean_df: pd.DataFrame) -> pd.DataFrame:
     """Agreguje transakcje do aktualnie otwartych pozycji: wolumen netto,
-    średnia cena zakupu i całkowita wydana kwota per ticker."""
+    średnia cena zakupu (metoda average cost) i koszt zainwestowany w
+    POZOSTAŁY (jeszcze niesprzedany) wolumen per ticker."""
     if clean_df.empty:
         return pd.DataFrame(columns=["symbol_xtb", "symbol_yahoo", "volume", "avg_price", "total_spent"])
 
@@ -457,7 +458,7 @@ def aggregate_positions(clean_df: pd.DataFrame) -> pd.DataFrame:
     sells = clean_df[clean_df["is_sell"]]
 
     buy_agg = buys.groupby(["symbol_xtb", "symbol_yahoo"], as_index=False).agg(
-        buy_volume=("volume", "sum"), total_spent=("amount", "sum")
+        buy_volume=("volume", "sum"), total_bought=("amount", "sum")
     )
     sell_agg = sells.groupby(["symbol_xtb", "symbol_yahoo"], as_index=False).agg(sell_volume=("volume", "sum"))
 
@@ -465,11 +466,19 @@ def aggregate_positions(clean_df: pd.DataFrame) -> pd.DataFrame:
     positions["sell_volume"] = positions["sell_volume"].fillna(0.0)
     positions["volume"] = positions["buy_volume"] - positions["sell_volume"]
     positions["avg_price"] = np.where(
-        positions["buy_volume"] > 0, positions["total_spent"] / positions["buy_volume"], np.nan
+        positions["buy_volume"] > 0, positions["total_bought"] / positions["buy_volume"], np.nan
     )
 
+    # WAŻNE: "total_bought" to koszt WSZYSTKICH historycznych zakupów danego
+    # tickera — jeśli część z nich już sprzedano (częściowe zamknięcie
+    # pozycji), użycie tej sumy jako "zainwestowano" zaniżałoby wynik
+    # procentowy zysku/straty. Koszt zainwestowany w pozostały wolumen
+    # liczymy metodą average cost: średnia cena zakupu * wolumen wciąż
+    # posiadany.
+    positions["total_spent"] = positions["avg_price"] * positions["volume"]
+
     positions = positions[positions["volume"] > 1e-9].reset_index(drop=True)
-    return positions.drop(columns=["buy_volume", "sell_volume"])
+    return positions.drop(columns=["buy_volume", "sell_volume", "total_bought"])
 
 
 # ============================================================================
