@@ -1098,17 +1098,30 @@ def fetch_gpw_scanner_data(tickers: tuple, period: str = "1y") -> pd.DataFrame:
     return df
 
 
-def compute_scanner_score(rsi: float, drawdown_pct: float, upside_pct: float) -> dict:
+def compute_scanner_score(rsi: float, drawdown_pct: float, upside_pct: float, num_analysts: float = np.nan) -> dict:
     """Autorska, zagregowana Ocena Końcowa (1–10) skanera GPW, oparta o trzy
     składowe: wyprzedanie RSI, głębokość spadku od szczytu 52W oraz potencjał
     wzrostu wg średniej ceny docelowej analityków. To narzędzie analityczno-
-    -edukacyjne, NIE stanowi rekomendacji inwestycyjnej."""
+    -edukacyjne, NIE stanowi rekomendacji inwestycyjnej.
+
+    WAŻNE: składowa 'potencjału' jest DYSKONTOWANA współczynnikiem pewności
+    opartym o liczbę analityków stojących za `target_mean` (yfinance) —
+    cena docelowa oparta na 0-1 analitykach dla małej spółki jest znacznie
+    mniej wiarygodna niż konsensus wielu analityków, więc nie powinna sama
+    windować oceny do maksimum."""
     # Składowa RSI: im niższe RSI (wyprzedanie), tym wyższy wynik.
     score_rsi = 5.0 if (rsi is None or (isinstance(rsi, float) and math.isnan(rsi))) else float(np.clip((80.0 - rsi) / 6.0, 0.0, 10.0))
     # Składowa spadku od szczytu: głębszy dołek = wyższy wynik (do granicy 50%).
     score_drawdown = 0.0 if (drawdown_pct is None or (isinstance(drawdown_pct, float) and math.isnan(drawdown_pct))) else float(np.clip(drawdown_pct / 5.0, 0.0, 10.0))
     # Składowa potencjału: wyższy szacowany upside wg analityków = wyższy wynik (do granicy 50%).
-    score_upside = 0.0 if (upside_pct is None or (isinstance(upside_pct, float) and math.isnan(upside_pct))) else float(np.clip(upside_pct / 5.0, 0.0, 10.0))
+    score_upside_raw = 0.0 if (upside_pct is None or (isinstance(upside_pct, float) and math.isnan(upside_pct))) else float(np.clip(upside_pct / 5.0, 0.0, 10.0))
+
+    # Współczynnik pewności 0.15-1.0: pełne zaufanie od 3+ analityków, silny
+    # spadek poniżej tego progu, minimalna "podłoga" 0.15 (a nie 0), bo nawet
+    # 1 analityk to trochę więcej informacji niż jej całkowity brak.
+    has_analysts = num_analysts is not None and not (isinstance(num_analysts, float) and math.isnan(num_analysts)) and num_analysts > 0
+    confidence = float(np.clip(num_analysts / 3.0, 0.15, 1.0)) if has_analysts else 0.15
+    score_upside = score_upside_raw * confidence
 
     final = 0.40 * score_upside + 0.35 * score_rsi + 0.25 * score_drawdown
     final = float(np.clip(final, 1.0, 10.0))
@@ -1125,8 +1138,11 @@ def compute_scanner_score(rsi: float, drawdown_pct: float, upside_pct: float) ->
         elif drawdown_pct > 10:
             reasons.append(f"korekta {drawdown_pct:.0f}% od szczytu 52W")
     if upside_pct is not None and not (isinstance(upside_pct, float) and math.isnan(upside_pct)):
-        if upside_pct > 25:
-            reasons.append(f"{upside_pct:.0f}% potencjału wg analityków")
+        n_txt = f"{int(num_analysts)}" if has_analysts else "0"
+        if confidence < 0.5 and upside_pct > 25:
+            reasons.append(f"{upside_pct:.0f}% potencjału wg analityków, ale niska wiarygodność (tylko {n_txt} analityków)")
+        elif upside_pct > 25:
+            reasons.append(f"{upside_pct:.0f}% potencjału wg analityków ({n_txt} analityków)")
         elif upside_pct > 10:
             reasons.append(f"{upside_pct:.0f}% szacowanego potencjału")
 
@@ -1138,7 +1154,7 @@ def compute_scanner_score(rsi: float, drawdown_pct: float, upside_pct: float) ->
     return {"score": round(final, 1), "rationale": rationale}
 
 
-def compute_scanner_status_labels(rsi: float, drawdown_pct: float, upside_pct: float) -> str:
+def compute_scanner_status_labels(rsi: float, drawdown_pct: float, upside_pct: float, num_analysts: float = np.nan) -> str:
     """Buduje listę etykiet/statusów dla wiersza tabeli skanera GPW."""
     labels = []
     if rsi is not None and not (isinstance(rsi, float) and math.isnan(rsi)) and rsi < 30:
@@ -1147,6 +1163,9 @@ def compute_scanner_status_labels(rsi: float, drawdown_pct: float, upside_pct: f
         labels.append("Duży potencjał (>25%)")
     if drawdown_pct is not None and not (isinstance(drawdown_pct, float) and math.isnan(drawdown_pct)) and drawdown_pct > 25:
         labels.append("Głęboki dołek od szczytu")
+    has_analysts = num_analysts is not None and not (isinstance(num_analysts, float) and math.isnan(num_analysts)) and num_analysts > 0
+    if not has_analysts or num_analysts < 3:
+        labels.append("⚠️ Mało/brak analityków — wycena mało wiarygodna")
     return " | ".join(labels) if labels else "—"
 
 
