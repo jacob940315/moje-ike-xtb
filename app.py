@@ -1150,7 +1150,118 @@ def compute_scanner_status_labels(rsi: float, drawdown_pct: float, upside_pct: f
     return " | ".join(labels) if labels else "—"
 
 
-def render_gpw_scanner_tab() -> None:
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_company_profile(symbol: str) -> dict:
+    """Pobiera dodatkowe dane fundamentalne (wzrost przychodów/zysków,
+    sektor, rekomendację analityków) używane WYŁĄCZNIE do wygenerowania
+    autorskiego komentarza jakościowego dla TOP 5 okazji skanera GPW.
+    Osobny, dedykowany cache — nie modyfikuje `fetch_market_data`."""
+    result = {
+        "symbol": symbol, "long_name": symbol, "sector": "Nieznany", "industry": "Nieznana",
+        "revenue_growth": np.nan, "earnings_growth": np.nan, "recommendation": "", "num_analysts": np.nan,
+    }
+    try:
+        info = yf.Ticker(symbol).info or {}
+        result["long_name"] = info.get("longName") or info.get("shortName") or symbol
+        result["sector"] = info.get("sector") or "Nieznany"
+        result["industry"] = info.get("industry") or "Nieznana"
+        result["revenue_growth"] = _safe_float(info.get("revenueGrowth"))
+        result["earnings_growth"] = _safe_float(info.get("earningsGrowth"))
+        result["recommendation"] = (info.get("recommendationKey") or "").lower()
+        result["num_analysts"] = _safe_float(info.get("numberOfAnalystOpinions"))
+    except Exception as exc:
+        logger.warning("Nie udało się pobrać profilu fundamentalnego dla %s: %s", symbol, exc)
+    return result
+
+
+_RECOMMENDATION_PL = {
+    "strong_buy": "zdecydowanie rekomendują kupno",
+    "buy": "rekomendują kupno",
+    "hold": "rekomendują utrzymanie pozycji",
+    "underperform": "rekomendują ostrożność (poniżej rynku)",
+    "sell": "rekomendują sprzedaż",
+}
+
+
+def generate_company_narrative(profile: dict, quant_rationale: str) -> str:
+    """Buduje autorski komentarz opisowy do jednej z TOP 5 okazji — łączy
+    twarde dane fundamentalne z yfinance (sektor, dynamika przychodów/zysków,
+    rekomendacja analityków) z uzasadnieniem ilościowym (RSI/spadek/potencjał).
+    To narzędzie analityczno-edukacyjne, a nie porada inwestycyjna — komentarz
+    NIE jest interpretacją newsów ani sytuacji biznesowej spółki, tylko
+    automatycznym opisem dostępnych wskaźników."""
+    parts = []
+    if profile.get("sector") and profile["sector"] != "Nieznany":
+        industry_txt = f" ({profile['industry']})" if profile.get("industry") and profile["industry"] != "Nieznana" else ""
+        parts.append(f"Spółka działa w sektorze {profile['sector']}{industry_txt}.")
+
+    rev_g = profile.get("revenue_growth")
+    if rev_g is not None and not (isinstance(rev_g, float) and math.isnan(rev_g)):
+        if rev_g > 0:
+            parts.append(f"Przychody rosną r/r o ok. {rev_g * 100:.0f}%.")
+        else:
+            parts.append(f"Przychody spadają r/r o ok. {abs(rev_g) * 100:.0f}%.")
+
+    earn_g = profile.get("earnings_growth")
+    if earn_g is not None and not (isinstance(earn_g, float) and math.isnan(earn_g)):
+        if earn_g > 0:
+            parts.append(f"Zyski rosną r/r o ok. {earn_g * 100:.0f}%.")
+        else:
+            parts.append(f"Zyski spadają r/r o ok. {abs(earn_g) * 100:.0f}%.")
+
+    rec = profile.get("recommendation")
+    if rec in _RECOMMENDATION_PL:
+        n_analysts = profile.get("num_analysts")
+        analysts_txt = f" (na podstawie {int(n_analysts)} analityków)" if n_analysts and not math.isnan(n_analysts) else ""
+        parts.append(f"Analitycy {_RECOMMENDATION_PL[rec]}{analysts_txt}.")
+
+    fundamentals_txt = " ".join(parts)
+    if fundamentals_txt:
+        return f"{fundamentals_txt} Od strony technicznej: {quant_rationale}"
+    return quant_rationale
+
+
+def generate_portfolio_tips(scanned: pd.DataFrame, portfolio_symbols: set) -> list:
+    """Generuje 2-3 auto-sugestie ("tipy") łączące wynik skanera GPW z
+    aktualnym portfelem użytkownika: (1) najlepiej oceniona posiadana pozycja,
+    (2) najsłabiej oceniona posiadana pozycja, (3) najlepsza okazja spoza
+    portfela. To narzędzie analityczno-edukacyjne, NIE stanowi rekomendacji
+    inwestycyjnej ani porady dot. konkretnych transakcji."""
+    tips = []
+    if scanned.empty:
+        return tips
+
+    held = scanned[scanned["symbol"].isin(portfolio_symbols)].sort_values("score", ascending=False)
+    not_held = scanned[~scanned["symbol"].isin(portfolio_symbols)].sort_values("score", ascending=False)
+
+    if not held.empty:
+        best_held = held.iloc[0]
+        if best_held["score"] >= 6.5:
+            tips.append(
+                f"💡 Twoja pozycja **{best_held['symbol']}** ma wysoką ocenę skanera "
+                f"({best_held['score']:.1f}/10) — {best_held['rationale']} Można rozważyć zwiększenie zaangażowania."
+            )
+        worst_held = held.iloc[-1]
+        if worst_held["score"] <= 4.0 and worst_held["symbol"] != best_held["symbol"]:
+            tips.append(
+                f"⚠️ Pozycja **{worst_held['symbol']}** w portfelu ma niską ocenę skanera "
+                f"({worst_held['score']:.1f}/10) — warto przeanalizować, czy warunki się nie pogorszyły."
+            )
+
+    if not not_held.empty and len(tips) < 3:
+        top_new = not_held.iloc[0]
+        tips.append(
+            f"🆕 Poza portfelem wyróżnia się **{top_new['symbol']}** (ocena {top_new['score']:.1f}/10) — "
+            f"{top_new['rationale']} Może warto dodać do watchlisty."
+        )
+
+    if not tips:
+        tips.append("ℹ️ Brak wyraźnych rozbieżności między portfelem a skanerem — obecne pozycje są zbliżone do neutralnych ocen.")
+
+    return tips[:3]
+
+
+def render_gpw_scanner_tab(portfolio: pd.DataFrame) -> None:
     st.subheader("🔍 Skaner GPW (WIG20 & mWIG40)")
     st.caption(
         "Automatyczny skan ok. 60 spółek z WIG20 i mWIG40 wg RSI(14), spadku od szczytu 52-tygodniowego "
@@ -1194,6 +1305,12 @@ def render_gpw_scanner_tab() -> None:
         with st.expander(f"⚠️ Brak danych dla {len(failed)} spółek"):
             st.write(", ".join(failed["symbol"].tolist()))
 
+    portfolio_symbols = set(portfolio["symbol_yahoo"].dropna().unique()) if portfolio is not None and not portfolio.empty else set()
+    tips = generate_portfolio_tips(valid, portfolio_symbols)
+    st.markdown("### 💡 Sugestie dla Twojego portfela")
+    for tip in tips:
+        st.info(tip)
+
     st.markdown("### 🔥 TOP 5 Najlepszych Okazji")
     top5 = valid.head(5)
     top_cols = st.columns(5)
@@ -1210,6 +1327,9 @@ def render_gpw_scanner_tab() -> None:
             st.write(f"**Cena obecna:** {price_txt}")
             st.write(f"**Target 6M:** {target6_txt} ({pct6_txt})")
             st.write(f"**Target 12M:** {target12_txt} ({pct12_txt})")
+            profile = fetch_company_profile(row["symbol"])
+            narrative = generate_company_narrative(profile, row["rationale"])
+            st.caption(f"🗒️ {narrative}")
 
     st.divider()
     st.markdown("### 📋 Pełna Tabela Skanera")
@@ -1353,7 +1473,7 @@ def main() -> None:
     with tab5:
         render_projection_tab(portfolio, total_value, cagr_pct, ike_limit)
     with tab6:
-        render_gpw_scanner_tab()
+        render_gpw_scanner_tab(portfolio)
 
 
 if __name__ == "__main__":
