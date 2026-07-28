@@ -2,7 +2,7 @@
 IKE Portfolio Analyzer — XTB Edition
 =====================================
 Aplikacja Streamlit do analizy portfela inwestycyjnego IKE Maklerskie (XTB):
-- parsowanie eksportu CSV z XTB i mapowanie tickerów na format Yahoo Finance,
+- parsowanie eksportu XLSX (historia rachunku) z XTB i mapowanie tickerów na format Yahoo Finance,
 - pobieranie danych rynkowych na żywo (yfinance) wraz z prognozami analityków,
 - autorski silnik "Smart Buy-The-Dip",
 - kalkulator rebalansu (klasyczny oraz przez nową wpłatę),
@@ -66,15 +66,32 @@ IKE_LIMITS = {
     2026: 28260.0,
 }
 
-# Aliasy nazw kolumn w eksporcie CSV z XTB (dopasowywane po znormalizowaniu:
-# małe litery, bez polskich znaków diakrytycznych). Kolejność ma znaczenie —
-# bardziej precyzyjne nazwy są sprawdzane w pierwszej kolejności.
+# Aliasy nazw kolumn w eksporcie XLSX z XTB (arkusze "Open Positions" /
+# "Closed Positions"; dopasowywane po znormalizowaniu: małe litery, bez
+# polskich znaków diakrytycznych). Kolejność ma znaczenie — bardziej precyzyjne
+# nazwy są sprawdzane w pierwszej kolejności.
 SYMBOL_COLS = ["symbol", "ticker", "instrument"]
 TYPE_COLS = ["typ", "rodzaj transakcji", "type", "side", "kierunek"]
 VOLUME_COLS = ["wolumen", "ilosc", "volume", "quantity", "qty", "shares"]
 PRICE_COLS = ["cena otwarcia", "open price", "cena zakupu", "price", "cena"]
 AMOUNT_COLS = ["kwota", "wartosc", "amount", "purchase value", "total"]
 DATE_COLS = ["data otwarcia", "open time", "czas otwarcia", "data", "date"]
+
+# Dodatkowe kolumny "nogi zamykającej" pozycji w arkuszu "Closed Positions"
+# (cena/kwota/data zamknięcia pozycji odpowiadają sprzedaży).
+CLOSE_PRICE_COLS = ["close price", "cena zamkniecia"]
+SALE_VALUE_COLS = ["sale value", "wartosc sprzedazy"]
+CLOSE_DATE_COLS = ["close time", "czas zamkniecia", "data zamkniecia"]
+
+# Arkusze eksportu historii rachunku XTB, po jakich fragmentach nazwy (po
+# normalizacji) je rozpoznajemy.
+OPEN_POSITIONS_SHEET_KEYWORDS = ["open", "position"]
+CLOSED_POSITIONS_SHEET_KEYWORDS = ["closed", "position"]
+
+# Słowa kluczowe używane do zlokalizowania wiersza nagłówka tabeli wewnątrz
+# arkusza XLSX (przed właściwą tabelą XTB umieszcza kilka wierszy metadanych
+# takich jak numer konta czy zakres dat).
+HEADER_ROW_KEYWORDS = ["ticker", "instrument", "symbol"]
 
 SELL_KEYWORDS = ["sell", "sprzedaz"]
 
@@ -249,36 +266,38 @@ def _normalize(text: str) -> str:
     return text
 
 
-def _decode_bytes(file_bytes: bytes) -> str:
-    """Eksporty CSV z polskich domów maklerskich bywają zapisane w Windows-1250
-    zamiast UTF-8 — próbujemy kilku kodowań po kolei."""
-    for encoding in ("utf-8-sig", "utf-8", "cp1250", "iso-8859-2", "latin-1"):
-        try:
-            return file_bytes.decode(encoding)
-        except (UnicodeDecodeError, LookupError):
+def _find_sheet(sheet_map: dict, keywords: list) -> Optional[str]:
+    """Znajduje nazwę arkusza (oryginalną), której znormalizowana wersja
+    zawiera wszystkie podane słowa kluczowe."""
+    for norm_name, original in sheet_map.items():
+        if all(k in norm_name for k in keywords):
+            return original
+    return None
+
+
+def _read_sheet_table(xls: "pd.ExcelFile", sheet_name: str) -> Optional[pd.DataFrame]:
+    """Wczytuje arkusz XLSX i lokalizuje właściwy wiersz nagłówka tabeli —
+    eksporty XTB zawierają na górze arkusza kilka wierszy metadanych (numer
+    konta, zakres dat), zanim pojawi się właściwa tabela z kolumnami takimi
+    jak 'Ticker', 'Volume' itd."""
+    raw = xls.parse(sheet_name, header=None)
+    header_idx = None
+    for idx in range(min(20, len(raw))):
+        row_vals = [v for v in raw.iloc[idx].tolist() if pd.notna(v)]
+        if len(row_vals) < 2:
             continue
-    return file_bytes.decode("utf-8", errors="replace")
+        low_joined = " ".join(_normalize(v) for v in row_vals)
+        if any(k in low_joined for k in HEADER_ROW_KEYWORDS):
+            header_idx = idx
+            break
+    if header_idx is None:
+        return None
 
-
-def _detect_delimiter(text: str) -> str:
-    sample_lines = [line for line in text.splitlines()[:20] if line.strip()]
-    sample = "\n".join(sample_lines)
-    return ";" if sample.count(";") >= sample.count(",") else ","
-
-
-def _locate_header_row(text: str, delimiter: str) -> int:
-    """Niektóre eksporty XTB zawierają linie tytułowe przed właściwym
-    nagłówkiem tabeli — szukamy pierwszego wiersza zawierającego kolumnę
-    identyfikującą symbol instrumentu. Puste linie są odfiltrowywane przed
-    liczeniem indeksu, bo pandas (skip_blank_lines=True) numeruje wiersze
-    dla parametru `header` dopiero PO usunięciu pustych linii."""
-    lines = [line for line in text.splitlines() if line.strip() != ""]
-    keywords = ["symbol", "ticker", "instrument"]
-    for idx, line in enumerate(lines[:50]):
-        low = _normalize(line)
-        if delimiter in line and any(k in low for k in keywords):
-            return idx
-    return 0
+    header = raw.iloc[header_idx].tolist()
+    data = raw.iloc[header_idx + 1:].copy()
+    data.columns = [str(c).strip() if pd.notna(c) else f"col_{i}" for i, c in enumerate(header)]
+    data = data.dropna(axis=1, how="all").dropna(how="all")
+    return data.reset_index(drop=True)
 
 
 def find_column(columns, aliases) -> Optional[str]:
@@ -311,50 +330,99 @@ def map_xtb_symbol_to_yahoo(xtb_symbol: str) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def parse_xtb_csv(file_bytes: bytes) -> pd.DataFrame:
-    """Parsuje surowy eksport CSV z XTB do znormalizowanej tabeli transakcji."""
-    text = _decode_bytes(file_bytes)
-    delimiter = _detect_delimiter(text)
-    header_row = _locate_header_row(text, delimiter)
-    decimal_sep = "," if delimiter == ";" else "."
+def parse_xtb_xlsx(file_bytes: bytes) -> pd.DataFrame:
+    """Parsuje eksport XLSX historii rachunku z XTB (arkusze 'Open Positions'
+    i/lub 'Closed Positions') do znormalizowanej tabeli transakcji.
 
+    Pozycje wciąż otwarte (arkusz 'Open Positions') trafiają jako pojedyncza
+    "noga" BUY — budują aktualny, otwarty wolumen. Pozycje już zamknięte
+    (arkusz 'Closed Positions') trafiają jako para nóg BUY+SELL o tym samym
+    wolumenie — dzięki temu w agregacji (`aggregate_positions`) netują się do
+    zera i poprawnie NIE wchodzą do aktualnego portfela, mimo że opisują
+    transakcje historyczne."""
     try:
-        df = pd.read_csv(
-            io.StringIO(text),
-            sep=delimiter,
-            engine="python",
-            decimal=decimal_sep,
-            header=header_row,
-            skip_blank_lines=True,
-        )
+        xls = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
     except Exception as exc:
-        raise ValueError(f"Nie udało się odczytać pliku CSV ({exc}). Sprawdź, czy to poprawny eksport z XTB.")
+        raise ValueError(f"Nie udało się odczytać pliku XLSX ({exc}). Sprawdź, czy to poprawny eksport z XTB.")
 
-    df.columns = [str(c).strip() for c in df.columns]
-    df = df.dropna(axis=1, how="all").dropna(how="all")
+    sheet_map = {_normalize(name): name for name in xls.sheet_names}
+    open_sheet = _find_sheet(sheet_map, OPEN_POSITIONS_SHEET_KEYWORDS)
+    closed_sheet = _find_sheet(sheet_map, CLOSED_POSITIONS_SHEET_KEYWORDS)
 
-    if df.empty:
-        raise ValueError("Plik CSV jest pusty lub nie zawiera żadnych wierszy danych.")
-
-    col_symbol = find_column(df.columns, SYMBOL_COLS)
-    if col_symbol is None:
+    if open_sheet is None and closed_sheet is None:
         raise ValueError(
-            "Nie znaleziono kolumny z symbolem instrumentu (np. 'Symbol'). "
-            "Sprawdź strukturę pliku — to musi być eksport historii transakcji z XTB."
+            "Nie znaleziono arkuszy 'Open Positions' ani 'Closed Positions' w pliku. "
+            "Sprawdź, czy to poprawny eksport historii rachunku z XTB "
+            "(w platformie XTB: Historia rachunku -> Eksport -> XLSX)."
         )
-    col_type = find_column(df.columns, TYPE_COLS)
-    col_volume = find_column(df.columns, VOLUME_COLS)
-    col_price = find_column(df.columns, PRICE_COLS)
-    col_amount = find_column(df.columns, AMOUNT_COLS)
-    col_date = find_column(df.columns, DATE_COLS)
 
-    clean = pd.DataFrame()
-    clean["symbol_xtb"] = df[col_symbol].astype(str).str.strip()
-    clean["volume"] = pd.to_numeric(df[col_volume], errors="coerce") if col_volume else np.nan
-    clean["price"] = pd.to_numeric(df[col_price], errors="coerce") if col_price else np.nan
-    clean["amount"] = pd.to_numeric(df[col_amount], errors="coerce").abs() if col_amount else np.nan
-    clean["type"] = df[col_type].astype(str) if col_type else "BUY"
-    clean["date"] = pd.to_datetime(df[col_date], errors="coerce", format="mixed", dayfirst=True) if col_date else pd.NaT
+    frames: list[pd.DataFrame] = []
+
+    if open_sheet is not None:
+        df = _read_sheet_table(xls, open_sheet)
+        if df is not None and not df.empty:
+            col_symbol = find_column(df.columns, SYMBOL_COLS)
+            if col_symbol is not None:
+                col_volume = find_column(df.columns, VOLUME_COLS)
+                col_price = find_column(df.columns, PRICE_COLS)
+                col_amount = find_column(df.columns, AMOUNT_COLS)
+                col_date = find_column(df.columns, DATE_COLS)
+
+                leg = pd.DataFrame()
+                leg["symbol_xtb"] = df[col_symbol].astype(str).str.strip()
+                leg["volume"] = pd.to_numeric(df[col_volume], errors="coerce") if col_volume else np.nan
+                leg["price"] = pd.to_numeric(df[col_price], errors="coerce") if col_price else np.nan
+                leg["amount"] = pd.to_numeric(df[col_amount], errors="coerce").abs() if col_amount else np.nan
+                leg["type"] = "BUY"
+                leg["date"] = pd.to_datetime(df[col_date], errors="coerce") if col_date else pd.NaT
+                frames.append(leg)
+
+    if closed_sheet is not None:
+        df = _read_sheet_table(xls, closed_sheet)
+        if df is not None and not df.empty:
+            col_symbol = find_column(df.columns, SYMBOL_COLS)
+            if col_symbol is not None:
+                col_volume = find_column(df.columns, VOLUME_COLS)
+                col_open_price = find_column(df.columns, PRICE_COLS)
+                col_close_price = find_column(df.columns, CLOSE_PRICE_COLS)
+                col_purchase_value = find_column(df.columns, AMOUNT_COLS)
+                col_sale_value = find_column(df.columns, SALE_VALUE_COLS)
+                col_open_date = find_column(df.columns, DATE_COLS)
+                col_close_date = find_column(df.columns, CLOSE_DATE_COLS)
+
+                symbol = df[col_symbol].astype(str).str.strip()
+                volume = pd.to_numeric(df[col_volume], errors="coerce") if col_volume else np.nan
+
+                buy_leg = pd.DataFrame()
+                buy_leg["symbol_xtb"] = symbol
+                buy_leg["volume"] = volume
+                buy_leg["price"] = pd.to_numeric(df[col_open_price], errors="coerce") if col_open_price else np.nan
+                buy_leg["amount"] = (
+                    pd.to_numeric(df[col_purchase_value], errors="coerce").abs() if col_purchase_value else np.nan
+                )
+                buy_leg["type"] = "BUY"
+                buy_leg["date"] = pd.to_datetime(df[col_open_date], errors="coerce") if col_open_date else pd.NaT
+
+                sell_leg = pd.DataFrame()
+                sell_leg["symbol_xtb"] = symbol
+                sell_leg["volume"] = volume
+                sell_leg["price"] = pd.to_numeric(df[col_close_price], errors="coerce") if col_close_price else np.nan
+                sell_leg["amount"] = (
+                    pd.to_numeric(df[col_sale_value], errors="coerce").abs() if col_sale_value else np.nan
+                )
+                sell_leg["type"] = "SELL"
+                sell_leg["date"] = pd.to_datetime(df[col_close_date], errors="coerce") if col_close_date else pd.NaT
+
+                frames.append(buy_leg)
+                frames.append(sell_leg)
+
+    if not frames:
+        raise ValueError(
+            "Nie znaleziono żadnych transakcji w arkuszach 'Open Positions' / 'Closed Positions'. "
+            "Sprawdź strukturę pliku XLSX."
+        )
+
+    clean = pd.concat(frames, ignore_index=True)
 
     # Odrzuć wiersze bez sensownego symbolu (np. puste linie podsumowania)
     clean = clean[clean["symbol_xtb"].str.len() > 0]
@@ -707,7 +775,7 @@ def render_overview_tab(portfolio: pd.DataFrame, raw_transactions: pd.DataFrame)
             )
             st.plotly_chart(_apply_dark_theme(fig2), use_container_width=True)
 
-    with st.expander("🔍 Podgląd rozpoznanych transakcji z pliku CSV"):
+    with st.expander("🔍 Podgląd rozpoznanych transakcji z pliku XLSX"):
         preview_cols = {
             "symbol_xtb": "Symbol (XTB)", "symbol_yahoo": "Symbol (Yahoo)", "type": "Typ",
             "volume": "Wolumen", "price": "Cena", "amount": "Kwota", "date": "Data",
@@ -965,7 +1033,7 @@ def main() -> None:
 
     with st.sidebar:
         st.header("⚙️ Ustawienia")
-        uploaded_file = st.file_uploader("Wgraj plik CSV z historii transakcji XTB", type=["csv"])
+        uploaded_file = st.file_uploader("Wgraj plik XLSX z historii rachunku XTB", type=["xlsx"])
         history_period = st.selectbox(
             "Okres danych historycznych (RSI / SMA)", HISTORY_PERIOD_OPTIONS, index=2,
             help="Dłuższy okres = dokładniejsze SMA200, ale wolniejsze pobieranie.",
@@ -987,16 +1055,16 @@ def main() -> None:
         st.caption("⚠️ Aplikacja ma charakter analityczno-edukacyjny. Nie stanowi porady inwestycyjnej ani podatkowej.")
 
     if uploaded_file is None:
-        st.info("👋 Wgraj plik CSV z historią transakcji XTB w panelu bocznym, aby rozpocząć analizę.")
+        st.info("👋 Wgraj plik XLSX z historią rachunku XTB w panelu bocznym, aby rozpocząć analizę.")
         st.stop()
 
     try:
-        clean_df = parse_xtb_csv(uploaded_file.getvalue())
+        clean_df = parse_xtb_xlsx(uploaded_file.getvalue())
     except ValueError as exc:
-        st.error(f"❌ Błąd podczas parsowania pliku CSV: {exc}")
+        st.error(f"❌ Błąd podczas parsowania pliku XLSX: {exc}")
         st.stop()
     except Exception as exc:  # zabezpieczenie przed nieoczekiwanymi błędami parsera
-        logger.exception("Nieoczekiwany błąd parsowania CSV")
+        logger.exception("Nieoczekiwany błąd parsowania XLSX")
         st.error(f"❌ Nieoczekiwany błąd podczas przetwarzania pliku: {exc}")
         st.stop()
 
