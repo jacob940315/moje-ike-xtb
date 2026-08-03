@@ -531,7 +531,7 @@ def fetch_market_data(symbol: str, period: str = "2y") -> dict:
         "target_mean": np.nan, "target_high": np.nan, "target_low": np.nan,
         "rsi14": np.nan, "sma50": np.nan, "sma200": np.nan,
         "week52_high": np.nan, "week52_low": np.nan, "dividend_yield": np.nan,
-        "sector": "Nieznany", "error": None,
+        "sector": "Nieznany", "momentum_1m_pct": np.nan, "error": None,
     }
     if not symbol:
         result["error"] = "Brak symbolu."
@@ -559,6 +559,13 @@ def fetch_market_data(symbol: str, period: str = "2y") -> dict:
         lookback = close.tail(252)
         result["week52_high"] = float(lookback.max()) if len(lookback) else np.nan
         result["week52_low"] = float(lookback.min()) if len(lookback) else np.nan
+
+        # Momentum ~1-miesięczny (ok. 21 sesji giełdowych) — używany jako
+        # tani, dostępny od ręki proxy "narracji rynkowej" (Krok 5 modelu
+        # holistycznego): nie zastępuje analizy newsów/sentymentu social
+        # media, ale przybliża, czy rynek ostatnio kupuje, czy sprzedaje spółkę.
+        if len(close) > 21:
+            result["momentum_1m_pct"] = float((close.iloc[-1] / close.iloc[-22] - 1) * 100)
 
         try:
             info = ticker.info or {}
@@ -1098,96 +1105,438 @@ def fetch_gpw_scanner_data(tickers: tuple, period: str = "1y") -> pd.DataFrame:
     return df
 
 
-def compute_scanner_score(rsi: float, drawdown_pct: float, upside_pct: float, num_analysts: float = np.nan) -> dict:
-    """Autorska, zagregowana Ocena Końcowa (1–10) skanera GPW, oparta o trzy
-    składowe: wyprzedanie RSI, głębokość spadku od szczytu 52W oraz potencjał
-    wzrostu wg średniej ceny docelowej analityków. To narzędzie analityczno-
-    -edukacyjne, NIE stanowi rekomendacji inwestycyjnej.
+# ----------------------------------------------------------------------
+# AUTORSKI MODEL HOLISTYCZNY WYCENY (5 filarów)
+# ----------------------------------------------------------------------
+# Poniższy model zastępuje wcześniejszą, prostszą "Ocenę Końcową" (RSI +
+# spadek + potencjał analityków) rozszerzoną, wieloczynnikową metodologią
+# wzorowaną na 6-krokowym procesie analityka fundamentalnego:
+#   Krok 1 — Fundamenty / wartość wewnętrzna      (waga 40%)
+#   Krok 2 — Analiza techniczna / momentum        (waga 20%)
+#   Krok 3 — Instytucje / insiderzy ("smart money")(waga 10%)
+#   Krok 4 — Sektor i makro                        (waga 15%)
+#   Krok 5 — Sentyment i narracja rynkowa          (waga 15%)
+#   Krok 6 — Ocena ważona 0-100 i klasyfikacja
+#
+# UPROSZCZENIA względem oryginalnej metodologii (świadomie przyjęte, żeby
+# skaner mógł szybko przeanalizować ~60 spółek naraz, korzystając wyłącznie
+# z darmowych danych yfinance, bez płatnych API ani analizy newsów/social
+# media na żywo):
+#   - Pełną wycenę DCF (zdyskontowane przepływy pieniężne) zastępuje zestaw
+#     mnożników wyceny (P/E, PEG, P/B, P/S, EV/EBITDA) — DCF wymagałby
+#     modelowania prognoz wzrostu i WACC dla każdej spółki z osobna, co jest
+#     zbyt kosztowne obliczeniowo i zbyt niepewne bez danych konsensusowych.
+#   - Rzeczywisty stosunek transakcji kupna/sprzedaży insiderów z ostatnich
+#     90 dni zastępuje statyczny % akcji w rękach insiderów/instytucji
+#     (yfinance nie udostępnia darmowo historii transakcji insiderów dla
+#     większości spółek z GPW).
+#   - Pełną analizę sentymentu z newsów, Reddita, X/Twittera i Seeking Alpha
+#     zastępuje prosty proxy: kierunek rekomendacji analityków oraz
+#     1-miesięczne momentum ceny. To NIE jest analiza NLP prawdziwych
+#     wiadomości — to przybliżenie oparte na dostępnych, tanich danych.
+#   - Otoczenie makro (stopy procentowe, inflacja, rotacja sektorowa)
+#     zastępuje jeden wskaźnik: czy szeroki indeks WIG20 jest w trendzie
+#     wzrostowym względem swojej SMA200 ("byczy" / "niedźwiedzi" rynek).
+#
+# Każdy filar jest oceniany w skali 0–10, a suma ważona ×10 daje wynik
+# 0–100, klasyfikowany dokładnie jak w oryginalnej metodologii:
+#   >= 70  -> Niedoszacowana (potencjalna okazja)
+#   40-69  -> Wyceniona sprawiedliwie (trzymaj / neutralnie)
+#   < 40   -> Przeszacowana (unikaj / rozważ ostrożność)
+#
+# To narzędzie ma charakter analityczno-edukacyjny. NIE stanowi porady
+# inwestycyjnej ani rekomendacji w rozumieniu przepisów o obrocie
+# instrumentami finansowymi.
 
-    WAŻNE: składowa 'potencjału' jest DYSKONTOWANA współczynnikiem pewności
-    opartym o liczbę analityków stojących za `target_mean` (yfinance) —
-    cena docelowa oparta na 0-1 analitykach dla małej spółki jest znacznie
-    mniej wiarygodna niż konsensus wielu analityków, więc nie powinna sama
-    windować oceny do maksimum."""
-    # Składowa RSI: im niższe RSI (wyprzedanie), tym wyższy wynik.
-    score_rsi = 5.0 if (rsi is None or (isinstance(rsi, float) and math.isnan(rsi))) else float(np.clip((80.0 - rsi) / 6.0, 0.0, 10.0))
-    # Składowa spadku od szczytu: głębszy dołek = wyższy wynik (do granicy 50%).
-    score_drawdown = 0.0 if (drawdown_pct is None or (isinstance(drawdown_pct, float) and math.isnan(drawdown_pct))) else float(np.clip(drawdown_pct / 5.0, 0.0, 10.0))
-    # Składowa potencjału: wyższy szacowany upside wg analityków = wyższy wynik (do granicy 50%).
-    score_upside_raw = 0.0 if (upside_pct is None or (isinstance(upside_pct, float) and math.isnan(upside_pct))) else float(np.clip(upside_pct / 5.0, 0.0, 10.0))
+HOLISTIC_WEIGHTS = {
+    "fundamenty": 0.40,
+    "techniczna": 0.20,
+    "instytucje_insiderzy": 0.10,
+    "sektor_makro": 0.15,
+    "sentyment_narracja": 0.15,
+}
 
-    # Współczynnik pewności 0.15-1.0: pełne zaufanie od 3+ analityków, silny
-    # spadek poniżej tego progu, minimalna "podłoga" 0.15 (a nie 0), bo nawet
-    # 1 analityk to trochę więcej informacji niż jej całkowity brak.
-    has_analysts = num_analysts is not None and not (isinstance(num_analysts, float) and math.isnan(num_analysts)) and num_analysts > 0
-    confidence = float(np.clip(num_analysts / 3.0, 0.15, 1.0)) if has_analysts else 0.15
-    score_upside = score_upside_raw * confidence
+# Krzywe punktowe (wartość mnożnika -> punkty 0-10) dla wskaźników wyceny —
+# im taniej, tym więcej punktów. Progi są ogólnymi regułami kciuka rynku
+# akcji, a nie dopasowaniem branżowym 1:1 (patrz też filar Sektor/Makro,
+# który dodatkowo porównuje spółkę do jej własnego sektora w zeskanowanej bazie).
+VALUATION_CURVES = {
+    "trailing_pe": [(8, 10), (15, 8), (22, 5), (35, 2), (55, 0)],
+    "peg_ratio": [(0.5, 10), (1.0, 8), (1.5, 5.5), (2.5, 2.5), (4.0, 0)],
+    "price_to_book": [(0.5, 10), (1.5, 8), (3.0, 5), (5.0, 2), (8.0, 0)],
+    "price_to_sales": [(0.5, 10), (1.5, 8), (3.0, 5), (5.0, 2), (8.0, 0)],
+    "ev_to_ebitda": [(4, 10), (8, 8), (12, 6), (18, 3), (25, 0)],
+}
 
-    final = 0.40 * score_upside + 0.35 * score_rsi + 0.25 * score_drawdown
-    final = float(np.clip(final, 1.0, 10.0))
 
-    reasons = []
-    if not math.isnan(rsi) if rsi is not None else False:
-        if rsi < 30:
-            reasons.append(f"silne wyprzedanie (RSI {rsi:.0f} < 30)")
-        elif rsi < 40:
-            reasons.append(f"umiarkowane wyprzedanie (RSI {rsi:.0f})")
-    if drawdown_pct is not None and not (isinstance(drawdown_pct, float) and math.isnan(drawdown_pct)):
-        if drawdown_pct > 25:
-            reasons.append(f"głęboki dołek {drawdown_pct:.0f}% od szczytu 52W")
-        elif drawdown_pct > 10:
-            reasons.append(f"korekta {drawdown_pct:.0f}% od szczytu 52W")
-    if upside_pct is not None and not (isinstance(upside_pct, float) and math.isnan(upside_pct)):
-        n_txt = f"{int(num_analysts)}" if has_analysts else "0"
-        if confidence < 0.5 and upside_pct > 25:
-            reasons.append(f"{upside_pct:.0f}% potencjału wg analityków, ale niska wiarygodność (tylko {n_txt} analityków)")
-        elif upside_pct > 25:
-            reasons.append(f"{upside_pct:.0f}% potencjału wg analityków ({n_txt} analityków)")
-        elif upside_pct > 10:
-            reasons.append(f"{upside_pct:.0f}% szacowanego potencjału")
+def _piecewise_score(value, points: list) -> Optional[float]:
+    """Liniowa interpolacja punktowa: dla rosnącej listy (wartość, punkty)
+    zwraca wynik 0-10 przypisany danej wartości, przycięty do skrajnych
+    punktów krzywej. Zwraca None, gdy wartość jest brakująca."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    if value <= xs[0]:
+        return float(ys[0])
+    if value >= xs[-1]:
+        return float(ys[-1])
+    for i in range(len(xs) - 1):
+        if xs[i] <= value <= xs[i + 1]:
+            t = (value - xs[i]) / (xs[i + 1] - xs[i])
+            return float(ys[i] + t * (ys[i + 1] - ys[i]))
+    return float(ys[-1])
 
-    if reasons:
-        rationale = "Silny sygnał: " + " połączone z ".join(reasons[:2]) + "." if len(reasons) > 1 else reasons[0].capitalize() + "."
+
+def _mean_available(values: dict) -> tuple:
+    """Zwraca (średnia dostępnych wartości albo None, słownik bez None-i)."""
+    available = {k: v for k, v in values.items() if v is not None and not (isinstance(v, float) and math.isnan(v))}
+    if not available:
+        return None, {}
+    return float(np.mean(list(available.values()))), available
+
+
+def compute_fundamental_pillar(row) -> tuple:
+    """Krok 1 — Fundamenty / wartość wewnętrzna (waga 40%). Łączy wycenę
+    względem mnożników (P/E, PEG, P/B, P/S, EV/EBITDA), dynamikę wzrostu
+    przychodów/zysków, rentowność (ROE), zadłużenie i płynność oraz zdolność
+    generowania gotówki (FCF yield) — jako uproszczony substytut pełnej
+    wyceny DCF."""
+    valuation_scores = [
+        _piecewise_score(row.get(field), curve) for field, curve in VALUATION_CURVES.items()
+    ]
+    valuation_score, _ = _mean_available({f"val_{i}": s for i, s in enumerate(valuation_scores)})
+
+    growth_vals = [g for g in (row.get("revenue_growth"), row.get("earnings_growth"))
+                   if g is not None and not (isinstance(g, float) and math.isnan(g))]
+    growth_score = float(np.clip(5 + np.mean(growth_vals) * 100 / 10, 0, 10)) if growth_vals else None
+
+    roe = row.get("roe")
+    quality_score = float(np.clip(roe * 100 / 25 * 10, 0, 10)) if (roe is not None and not (isinstance(roe, float) and math.isnan(roe))) else None
+
+    de = row.get("debt_to_equity")
+    cr = row.get("current_ratio")
+    leverage_score, _ = _mean_available({
+        "debt": float(np.clip((150 - de) / 150 * 10, 0, 10)) if (de is not None and not (isinstance(de, float) and math.isnan(de))) else None,
+        "current_ratio": float(np.clip(cr * 4, 0, 10)) if (cr is not None and not (isinstance(cr, float) and math.isnan(cr))) else None,
+    })
+
+    fcf_yield = row.get("fcf_yield_pct")
+    cash_score = float(np.clip(5 + fcf_yield, 0, 10)) if (fcf_yield is not None and not (isinstance(fcf_yield, float) and math.isnan(fcf_yield))) else None
+
+    components = {
+        "Wycena (P/E, PEG, P/B, P/S, EV/EBITDA)": valuation_score,
+        "Dynamika wzrostu (przychody/zyski)": growth_score,
+        "Rentowność (ROE)": quality_score,
+        "Zadłużenie i płynność": leverage_score,
+        "Generowanie gotówki (FCF yield)": cash_score,
+    }
+    fundamental_score, available = _mean_available(components)
+    return (fundamental_score if fundamental_score is not None else 5.0), components
+
+
+def compute_technical_pillar(row) -> tuple:
+    """Krok 2 — Analiza techniczna / momentum (waga 20%). Sprawdza, czy
+    obraz techniczny (RSI, pozycja względem SMA200, dystans od 52W High)
+    potwierdza, czy zaprzecza tezie o niedowartościowaniu."""
+    rsi = row.get("rsi14")
+    price = row.get("current_price")
+    sma200 = row.get("sma200")
+    drawdown = row.get("drawdown_pct")
+
+    rsi_score = float(np.clip((70 - rsi) / 5, 0, 10)) if (rsi is not None and not (isinstance(rsi, float) and math.isnan(rsi))) else None
+
+    trend_score = None
+    if (price is not None and sma200 is not None
+            and not (isinstance(price, float) and math.isnan(price))
+            and not (isinstance(sma200, float) and math.isnan(sma200)) and sma200 > 0):
+        dist_pct = (price - sma200) / sma200 * 100
+        trend_score = float(np.clip(5 + dist_pct / 3, 0, 10))
+
+    drawdown_score = float(np.clip(drawdown / 5, 0, 10)) if (drawdown is not None and not (isinstance(drawdown, float) and math.isnan(drawdown))) else None
+
+    components = {
+        "RSI(14) — wyprzedanie / wykupienie": rsi_score,
+        "Trend względem SMA200": trend_score,
+        "Dystans od szczytu 52W (potencjał odbicia)": drawdown_score,
+    }
+    technical_score, _ = _mean_available(components)
+    return (technical_score if technical_score is not None else 5.0), components
+
+
+def compute_institutional_pillar(row) -> tuple:
+    """Krok 3 — Instytucje / insiderzy, "smart money" (waga 10%). yfinance
+    nie udostępnia darmowo prawdziwego stosunku kupna/sprzedaży insiderów z
+    ostatnich 90 dni, więc jako przybliżenie używamy statycznego % akcji w
+    rękach instytucji (zaufanie "dużych graczy") oraz % w rękach insiderów
+    (skin in the game) — to uproszczenie, nie pełna analiza transakcji."""
+    held_inst = row.get("held_pct_institutions")
+    held_ins = row.get("held_pct_insiders")
+
+    inst_score = float(np.clip(held_inst * 100 / 30 * 10, 0, 10)) if (held_inst is not None and not (isinstance(held_inst, float) and math.isnan(held_inst))) else None
+    ins_score = float(np.clip(held_ins * 100 / 15 * 10, 0, 10)) if (held_ins is not None and not (isinstance(held_ins, float) and math.isnan(held_ins))) else None
+
+    components = {
+        "Udział instytucji w akcjonariacie": inst_score,
+        "Udział insiderów (skin in the game)": ins_score,
+    }
+    institutional_score, _ = _mean_available(components)
+    return (institutional_score if institutional_score is not None else 5.0), components
+
+
+def compute_sector_macro_pillar(sector_valuation_percentile, macro_score) -> tuple:
+    """Krok 4 — Sektor i makro (waga 15%). Porównuje wycenę spółki z medianą
+    jej sektora w zeskanowanej bazie (WIG20+mWIG40) oraz nakłada prosty
+    "reżim rynkowy" oparty o trend indeksu WIG20 względem SMA200 — jako
+    uproszczony substytut pełnej analizy stóp procentowych/inflacji/rotacji
+    sektorowej."""
+    sector_score = float(np.clip(sector_valuation_percentile * 10, 0, 10)) if (sector_valuation_percentile is not None and not (isinstance(sector_valuation_percentile, float) and math.isnan(sector_valuation_percentile))) else None
+    components = {
+        "Wycena względem sektora (peer group)": sector_score,
+        "Reżim rynkowy (trend WIG20 vs SMA200)": macro_score,
+    }
+    combined, _ = _mean_available(components)
+    return (combined if combined is not None else 5.0), components
+
+
+def compute_sentiment_pillar(row) -> tuple:
+    """Krok 5 — Sentyment i narracja rynkowa (waga 15%). ABY UNIKNĄĆ
+    kosztownego i wolnego web-scrapingu/NLP newsów, Reddita i X dla ~60
+    spółek na raz, jako proxy narracji rynkowej używamy: kierunku
+    rekomendacji analityków oraz 1-miesięcznego momentum ceny. To
+    PRZYBLIŻENIE, nie prawdziwa analiza sentymentu z mediów."""
+    rec_mean = row.get("recommendation_mean")
+    momentum = row.get("momentum_1m_pct")
+
+    rec_score = float(np.clip((5 - rec_mean) / 4 * 10, 0, 10)) if (rec_mean is not None and not (isinstance(rec_mean, float) and math.isnan(rec_mean))) else None
+    momentum_score = float(np.clip(5 + momentum / 2, 0, 10)) if (momentum is not None and not (isinstance(momentum, float) and math.isnan(momentum))) else None
+
+    components = {
+        "Rekomendacja analityków (proxy narracji)": rec_score,
+        "Momentum ceny 1M (proxy sentymentu rynkowego)": momentum_score,
+    }
+    sentiment_score, _ = _mean_available(components)
+    return (sentiment_score if sentiment_score is not None else 5.0), components
+
+
+def compute_holistic_verdict(row, sector_valuation_percentile: float, macro_score: float) -> dict:
+    """Krok 6 — łączy wszystkie 5 filarów w ocenę ważoną 0-100 i klasyfikuje
+    spółkę dokładnie jak w oryginalnej metodologii: Niedoszacowana (>=70),
+    Wyceniona sprawiedliwie (40-69), Przeszacowana (<40). To narzędzie
+    analityczno-edukacyjne, NIE stanowi rekomendacji inwestycyjnej."""
+    fund_score, fund_detail = compute_fundamental_pillar(row)
+    tech_score, tech_detail = compute_technical_pillar(row)
+    inst_score, inst_detail = compute_institutional_pillar(row)
+    sector_score, sector_detail = compute_sector_macro_pillar(sector_valuation_percentile, macro_score)
+    sent_score, sent_detail = compute_sentiment_pillar(row)
+
+    total = (
+        HOLISTIC_WEIGHTS["fundamenty"] * fund_score
+        + HOLISTIC_WEIGHTS["techniczna"] * tech_score
+        + HOLISTIC_WEIGHTS["instytucje_insiderzy"] * inst_score
+        + HOLISTIC_WEIGHTS["sektor_makro"] * sector_score
+        + HOLISTIC_WEIGHTS["sentyment_narracja"] * sent_score
+    ) * 10
+    total = float(np.clip(total, 0.0, 100.0))
+
+    if total >= 70:
+        classification = "🟢 Niedoszacowana"
+    elif total >= 40:
+        classification = "🟡 Wyceniona sprawiedliwie"
     else:
-        rationale = "Brak wyraźnych sygnałów — spółka blisko neutralnych poziomów wskaźników."
+        classification = "🔴 Przeszacowana"
 
-    return {"score": round(final, 1), "rationale": rationale}
+    pillar_scores = {
+        "Fundamenty (40%)": round(fund_score, 1),
+        "Technika (20%)": round(tech_score, 1),
+        "Instytucje/Insiderzy (10%)": round(inst_score, 1),
+        "Sektor/Makro (15%)": round(sector_score, 1),
+        "Sentyment/Narracja (15%)": round(sent_score, 1),
+    }
+    ranked = sorted(pillar_scores.items(), key=lambda kv: kv[1], reverse=True)
+    best, worst = ranked[0], ranked[-1]
+    rationale = f"Najmocniejszy filar: {best[0]} ({best[1]:.1f}/10). Najsłabszy: {worst[0]} ({worst[1]:.1f}/10)."
+
+    return {
+        "score": round(total, 1),
+        "classification": classification,
+        "pillar_scores": pillar_scores,
+        "fundamentals_detail": fund_detail,
+        "technical_detail": tech_detail,
+        "institutional_detail": inst_detail,
+        "sector_macro_detail": sector_detail,
+        "sentiment_detail": sent_detail,
+        "rationale": rationale,
+    }
 
 
-def compute_scanner_status_labels(rsi: float, drawdown_pct: float, upside_pct: float, num_analysts: float = np.nan) -> str:
+def compute_sector_valuation_percentiles(df: pd.DataFrame) -> pd.Series:
+    """Dla każdej spółki liczy percentyl 'taniości' (0-1, wyżej = taniej) na
+    tle innych spółek z TEGO SAMEGO sektora w zeskanowanej bazie, uśredniając
+    P/E i EV/EBITDA. Sektory z mniej niż 3 spółkami o dostępnych danych
+    dostają neutralny wynik 0.5 — zbyt mała próbka, by wiarygodnie porównywać."""
+
+    def _cheap_percentile(s: pd.Series) -> pd.Series:
+        if s.notna().sum() < 3:
+            return pd.Series(0.5, index=s.index)
+        return 1 - s.rank(pct=True, na_option="keep")
+
+    sector_group = df["sector"].fillna("Nieznany")
+    pe_pct = df.groupby(sector_group)["trailing_pe"].transform(_cheap_percentile)
+    ev_pct = df.groupby(sector_group)["ev_to_ebitda"].transform(_cheap_percentile)
+    return pd.concat([pe_pct, ev_pct], axis=1).mean(axis=1, skipna=True)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_macro_regime() -> dict:
+    """Krok 4 (część 'makro') — bardzo uproszczony proxy reżimu rynkowego:
+    sprawdza, czy indeks WIG20 znajduje się powyżej, czy poniżej swojej
+    SMA200 (trend wzrostowy vs spadkowy). Nie zastępuje pełnej analizy stóp
+    procentowych, inflacji i rotacji sektorowej z oryginalnej metodologii —
+    to jedno dodatkowe, tanie zapytanie, które pozwala choć trochę odróżnić
+    'byczy' rynek od 'niedźwiedziego'. W razie niepowodzenia zwraca wynik
+    neutralny (5.0), nigdy nie przerywa działania skanera."""
+    result = {"benchmark": None, "distance_to_sma200_pct": np.nan, "macro_score": 5.0}
+    for sym in ("^WIG20", "WIG20.WA"):
+        try:
+            hist = yf.Ticker(sym).history(period="2y", auto_adjust=True)
+            close = hist["Close"].dropna() if hist is not None and not hist.empty else pd.Series(dtype=float)
+            if len(close) < 50:
+                continue
+            sma200 = compute_sma(close, 200).dropna()
+            if sma200.empty:
+                continue
+            price, sma = float(close.iloc[-1]), float(sma200.iloc[-1])
+            if sma <= 0:
+                continue
+            distance_pct = (price - sma) / sma * 100
+            result["benchmark"] = sym
+            result["distance_to_sma200_pct"] = distance_pct
+            result["macro_score"] = float(np.clip(5 + distance_pct / 4, 0, 10))
+            break
+        except Exception as exc:
+            logger.warning("Nie udało się pobrać danych indeksu referencyjnego %s: %s", sym, exc)
+    return result
+
+
+def compute_holistic_status_labels(row, classification: str) -> str:
     """Buduje listę etykiet/statusów dla wiersza tabeli skanera GPW."""
-    labels = []
-    if rsi is not None and not (isinstance(rsi, float) and math.isnan(rsi)) and rsi < 30:
-        labels.append("Mocne Wyprzedanie (RSI < 30)")
-    if upside_pct is not None and not (isinstance(upside_pct, float) and math.isnan(upside_pct)) and upside_pct > 25:
-        labels.append("Duży potencjał (>25%)")
-    if drawdown_pct is not None and not (isinstance(drawdown_pct, float) and math.isnan(drawdown_pct)) and drawdown_pct > 25:
-        labels.append("Głęboki dołek od szczytu")
+    labels = [classification]
+    pe = row.get("trailing_pe")
+    if pe is not None and not (isinstance(pe, float) and math.isnan(pe)) and pe < 12:
+        labels.append("Niski P/E (<12)")
+    held_inst = row.get("held_pct_institutions")
+    if held_inst is not None and not (isinstance(held_inst, float) and math.isnan(held_inst)) and held_inst > 0.3:
+        labels.append("Wysoki udział instytucji")
+    num_analysts = row.get("num_analysts")
     has_analysts = num_analysts is not None and not (isinstance(num_analysts, float) and math.isnan(num_analysts)) and num_analysts > 0
     if not has_analysts or num_analysts < 3:
         labels.append("⚠️ Mało/brak analityków — wycena mało wiarygodna")
     return " | ".join(labels) if labels else "—"
 
 
+def generate_holistic_narrative(row, verdict: dict) -> str:
+    """Buduje autorski komentarz jakościowy łączący wszystkie 5 filarów
+    modelu holistycznego w jeden zwięzły akapit — analogicznie do
+    podsumowania z oryginalnej metodologii (Krok 6). To narzędzie
+    analityczno-edukacyjne, NIE stanowi porady inwestycyjnej ani
+    interpretacji bieżących wydarzeń biznesowych spółki."""
+    parts = [f"Klasyfikacja: {verdict['classification']} ({verdict['score']:.0f}/100)."]
+
+    pe = row.get("trailing_pe")
+    if pe is not None and not (isinstance(pe, float) and math.isnan(pe)):
+        parts.append(f"P/E={pe:.1f}.")
+    peg = row.get("peg_ratio")
+    if peg is not None and not (isinstance(peg, float) and math.isnan(peg)):
+        parts.append(f"PEG={peg:.2f}.")
+
+    growth_vals = [g for g in (row.get("revenue_growth"), row.get("earnings_growth")) if g is not None and not (isinstance(g, float) and math.isnan(g))]
+    if growth_vals:
+        avg_growth = np.mean(growth_vals) * 100
+        parts.append(f"Śr. wzrost przychodów/zysków r/r ok. {avg_growth:+.0f}%.")
+
+    rec = row.get("recommendation")
+    if rec in _RECOMMENDATION_PL:
+        parts.append(f"Analitycy {_RECOMMENDATION_PL[rec]}.")
+
+    momentum = row.get("momentum_1m_pct")
+    if momentum is not None and not (isinstance(momentum, float) and math.isnan(momentum)):
+        kierunek = "wzrostowe" if momentum > 0 else "spadkowe"
+        parts.append(f"Momentum 1M {kierunek} ({momentum:+.1f}%).")
+
+    parts.append(verdict["rationale"])
+    return " ".join(parts)
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
-def fetch_company_profile(symbol: str) -> dict:
-    """Pobiera dodatkowe dane fundamentalne (wzrost przychodów/zysków,
-    sektor, rekomendację analityków) używane WYŁĄCZNIE do wygenerowania
-    autorskiego komentarza jakościowego dla TOP 5 okazji skanera GPW.
-    Osobny, dedykowany cache — nie modyfikuje `fetch_market_data`."""
+def fetch_company_profile(symbol: str, period: str = "6mo") -> dict:
+    """Pobiera pełny profil fundamentalny + własnościowy + ryzyka spółki,
+    używany zarówno do autorskiego komentarza jakościowego (TOP 5 okazji),
+    jak i do modelu holistycznej oceny 'Niedoszacowana / Wyceniona
+    sprawiedliwie / Przeszacowana' (patrz `compute_holistic_verdict`).
+    Osobny, dedykowany cache — nie modyfikuje `fetch_market_data`.
+
+    Jedno wywołanie łączy dane, które wcześniej pobierały dwie osobne
+    funkcje (`fetch_company_profile` + `fetch_stability_metrics`) — beta i
+    zmienność historyczna są teraz liczone tutaj, żeby uniknąć podwójnego
+    odpytywania Yahoo Finance dla tego samego tickera."""
     result = {
         "symbol": symbol, "long_name": symbol, "sector": "Nieznany", "industry": "Nieznana",
-        "revenue_growth": np.nan, "earnings_growth": np.nan, "recommendation": "", "num_analysts": np.nan,
+        "revenue_growth": np.nan, "earnings_growth": np.nan, "recommendation": "", "recommendation_mean": np.nan,
+        "num_analysts": np.nan,
+        # --- Wycena (Krok 1 modelu holistycznego) ---
+        "trailing_pe": np.nan, "forward_pe": np.nan, "peg_ratio": np.nan, "price_to_book": np.nan,
+        "price_to_sales": np.nan, "ev_to_ebitda": np.nan,
+        # --- Zadłużenie / płynność / gotówka (Krok 1) ---
+        "debt_to_equity": np.nan, "current_ratio": np.nan, "roe": np.nan,
+        "free_cashflow": np.nan, "market_cap": np.nan, "fcf_yield_pct": np.nan,
+        # --- Instytucje / insiderzy (Krok 3) ---
+        "held_pct_institutions": np.nan, "held_pct_insiders": np.nan,
+        # --- Ryzyko / stabilność (używane też w sekcji "Stabilne Top Picks") ---
+        "beta": np.nan, "volatility_pct": np.nan,
     }
     try:
-        info = yf.Ticker(symbol).info or {}
+        ticker = yf.Ticker(symbol)
+        try:
+            info = ticker.info or {}
+        except Exception as exc:
+            logger.warning("ticker.info nie powiodło się dla %s: %s", symbol, exc)
+            info = {}
+
         result["long_name"] = info.get("longName") or info.get("shortName") or symbol
         result["sector"] = info.get("sector") or "Nieznany"
         result["industry"] = info.get("industry") or "Nieznana"
         result["revenue_growth"] = _safe_float(info.get("revenueGrowth"))
         result["earnings_growth"] = _safe_float(info.get("earningsGrowth"))
         result["recommendation"] = (info.get("recommendationKey") or "").lower()
+        result["recommendation_mean"] = _safe_float(info.get("recommendationMean"))
         result["num_analysts"] = _safe_float(info.get("numberOfAnalystOpinions"))
+
+        result["trailing_pe"] = _safe_float(info.get("trailingPE"))
+        result["forward_pe"] = _safe_float(info.get("forwardPE"))
+        result["peg_ratio"] = _safe_float(info.get("pegRatio") or info.get("trailingPegRatio"))
+        result["price_to_book"] = _safe_float(info.get("priceToBook"))
+        result["price_to_sales"] = _safe_float(info.get("priceToSalesTrailing12Months"))
+        result["ev_to_ebitda"] = _safe_float(info.get("enterpriseToEbitda"))
+
+        result["debt_to_equity"] = _safe_float(info.get("debtToEquity"))
+        result["current_ratio"] = _safe_float(info.get("currentRatio"))
+        result["roe"] = _safe_float(info.get("returnOnEquity"))
+        result["free_cashflow"] = _safe_float(info.get("freeCashflow"))
+        result["market_cap"] = _safe_float(info.get("marketCap"))
+        if not math.isnan(result["free_cashflow"]) and not math.isnan(result["market_cap"]) and result["market_cap"] > 0:
+            result["fcf_yield_pct"] = result["free_cashflow"] / result["market_cap"] * 100
+
+        result["held_pct_institutions"] = _safe_float(info.get("heldPercentInstitutions"))
+        result["held_pct_insiders"] = _safe_float(info.get("heldPercentInsiders"))
+
+        result["beta"] = _safe_float(info.get("beta"))
+
+        hist = ticker.history(period=period, auto_adjust=True)
+        close = hist["Close"].dropna() if hist is not None and not hist.empty else pd.Series(dtype=float)
+        if len(close) > 5:
+            daily_returns = close.pct_change().dropna()
+            result["volatility_pct"] = float(daily_returns.std() * np.sqrt(252) * 100)
     except Exception as exc:
         logger.warning("Nie udało się pobrać profilu fundamentalnego dla %s: %s", symbol, exc)
     return result
@@ -1274,60 +1623,29 @@ def generate_portfolio_tips(scanned: pd.DataFrame, portfolio_symbols: set) -> li
 
     if not held.empty:
         best_held = held.iloc[0]
-        if best_held["score"] >= 6.5:
+        if best_held["score"] >= 70:
             tips.append(
-                f"💡 Twoja pozycja **{best_held['symbol']}** ma wysoką ocenę skanera "
-                f"({best_held['score']:.1f}/10) — {best_held['rationale']} Można rozważyć zwiększenie zaangażowania."
+                f"💡 Twoja pozycja **{best_held['symbol']}** wypada jako {best_held['classification']} "
+                f"({best_held['score']:.0f}/100) — {best_held['rationale']} Można rozważyć zwiększenie zaangażowania."
             )
         worst_held = held.iloc[-1]
-        if worst_held["score"] <= 4.0 and worst_held["symbol"] != best_held["symbol"]:
+        if worst_held["score"] < 40 and worst_held["symbol"] != best_held["symbol"]:
             tips.append(
-                f"⚠️ Pozycja **{worst_held['symbol']}** w portfelu ma niską ocenę skanera "
-                f"({worst_held['score']:.1f}/10) — warto przeanalizować, czy warunki się nie pogorszyły."
+                f"⚠️ Pozycja **{worst_held['symbol']}** w portfelu wypada jako {worst_held['classification']} "
+                f"({worst_held['score']:.0f}/100) — warto przeanalizować, czy warunki się nie pogorszyły."
             )
 
     if not not_held.empty and len(tips) < 3:
         top_new = not_held.iloc[0]
         tips.append(
-            f"🆕 Poza portfelem wyróżnia się **{top_new['symbol']}** (ocena {top_new['score']:.1f}/10) — "
-            f"{top_new['rationale']} Może warto dodać do watchlisty."
+            f"🆕 Poza portfelem wyróżnia się **{top_new['symbol']}** ({top_new['classification']}, "
+            f"{top_new['score']:.0f}/100) — {top_new['rationale']} Może warto dodać do watchlisty."
         )
 
     if not tips:
         tips.append("ℹ️ Brak wyraźnych rozbieżności między portfelem a skanerem — obecne pozycje są zbliżone do neutralnych ocen.")
 
     return tips[:3]
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_stability_metrics(symbol: str, period: str = "6mo") -> dict:
-    """Pobiera dane pod kątem STABILNOŚCI (a nie okazji/dołka): betę, roczną
-    zmienność historyczną (odchylenie std dziennych zwrotów, annualizowane)
-    oraz dynamikę przychodów/zysków. Osobny, dedykowany cache — używany
-    wyłącznie do sekcji 'Stabilne Top Picks', nie modyfikuje innych funkcji."""
-    result = {
-        "symbol": symbol, "beta": np.nan, "volatility_pct": np.nan,
-        "revenue_growth": np.nan, "earnings_growth": np.nan,
-    }
-    try:
-        ticker = yf.Ticker(symbol)
-        try:
-            info = ticker.info or {}
-        except Exception as exc:
-            logger.warning("ticker.info nie powiodło się dla %s (stability): %s", symbol, exc)
-            info = {}
-        result["beta"] = _safe_float(info.get("beta"))
-        result["revenue_growth"] = _safe_float(info.get("revenueGrowth"))
-        result["earnings_growth"] = _safe_float(info.get("earningsGrowth"))
-
-        hist = ticker.history(period=period, auto_adjust=True)
-        close = hist["Close"].dropna() if hist is not None and not hist.empty else pd.Series(dtype=float)
-        if len(close) > 5:
-            daily_returns = close.pct_change().dropna()
-            result["volatility_pct"] = float(daily_returns.std() * np.sqrt(252) * 100)
-    except Exception as exc:
-        logger.warning("Nie udało się pobrać metryk stabilności dla %s: %s", symbol, exc)
-    return result
 
 
 def compute_stability_score(beta: float, volatility_pct: float, dividend_yield: float, revenue_growth: float, earnings_growth: float) -> dict:
@@ -1410,18 +1728,9 @@ def render_gpw_scanner_tab(portfolio: pd.DataFrame) -> None:
         st.error("Nie udało się pobrać danych dla żadnej spółki z listy skanera.")
         return
 
-    scored = valid.apply(
-        lambda r: compute_scanner_score(r.get("rsi14"), r.get("drawdown_pct"), r.get("upside_pct")), axis=1, result_type="expand"
-    )
-    valid = pd.concat([valid.reset_index(drop=True), scored.reset_index(drop=True)], axis=1)
-    valid["status_labels"] = valid.apply(
-        lambda r: compute_scanner_status_labels(r.get("rsi14"), r.get("drawdown_pct"), r.get("upside_pct")), axis=1
-    )
-    valid = valid.sort_values("score", ascending=False).reset_index(drop=True)
-
-    # Pełne nazwy spółek + rekomendacje analityków — pobierane raz dla całej
-    # zeskanowanej bazy, żeby móc je pokazać zarówno w TOP 5 Okazji, jak i w
-    # Stabilnych Top Pickach oraz w pełnej tabeli (zamiast samych tickerów).
+    # Pełny profil fundamentalny + własnościowy + ryzyka — pobierany RAZ dla
+    # całej zeskanowanej bazy (jeden dedykowany cache), używany zarówno do
+    # modelu holistycznego, jak i do sekcji "Stabilne Top Picks" poniżej.
     profile_rows = [fetch_company_profile(sym) for sym in valid["symbol"]]
     profile_df = pd.DataFrame(profile_rows).drop(columns=["sector"], errors="ignore")
     valid = valid.merge(profile_df, on="symbol", how="left")
@@ -1431,20 +1740,49 @@ def render_gpw_scanner_tab(portfolio: pd.DataFrame) -> None:
         with st.expander(f"⚠️ Brak danych dla {len(failed)} spółek"):
             st.write(", ".join(failed["symbol"].tolist()))
 
+    # --- Model holistyczny: Krok 4 (część sektorowa i makro), liczony raz
+    # dla całej bazy, zanim ocenimy poszczególne spółki. ---
+    valid["sector_valuation_percentile"] = compute_sector_valuation_percentiles(valid)
+    macro = fetch_macro_regime()
+    macro_score = macro["macro_score"]
+
+    verdicts = [
+        compute_holistic_verdict(row, row.get("sector_valuation_percentile"), macro_score)
+        for _, row in valid.iterrows()
+    ]
+    verdict_df = pd.DataFrame(verdicts)
+    valid = pd.concat([valid.reset_index(drop=True), verdict_df.reset_index(drop=True)], axis=1)
+    valid["status_labels"] = valid.apply(
+        lambda r: compute_holistic_status_labels(r, r.get("classification")), axis=1
+    )
+    valid = valid.sort_values("score", ascending=False).reset_index(drop=True)
+
+    if macro.get("benchmark"):
+        regime_txt = "byczy (powyżej SMA200)" if macro["macro_score"] >= 5 else "niedźwiedzi (poniżej SMA200)"
+        st.caption(
+            f"📐 Model holistyczny (0-100): Fundamenty 40% • Technika 20% • Instytucje/Insiderzy 10% • "
+            f"Sektor/Makro 15% • Sentyment/Narracja 15%. Reżim rynkowy wg {macro['benchmark']}: {regime_txt} "
+            f"({macro['distance_to_sma200_pct']:+.1f}% od SMA200)."
+        )
+    st.caption(
+        "⚠️ Uproszczenie metodologii: brak pełnej wyceny DCF, rzeczywistych transakcji insiderów oraz "
+        "analizy sentymentu z newsów/social media na żywo — patrz komentarz w kodzie (`compute_holistic_verdict`) "
+        "po szczegóły przyjętych przybliżeń. Klasyfikacja: 🟢 Niedoszacowana (≥70) • 🟡 Wyceniona sprawiedliwie (40-69) • 🔴 Przeszacowana (<40)."
+    )
+
     portfolio_symbols = set(portfolio["symbol_yahoo"].dropna().unique()) if portfolio is not None and not portfolio.empty else set()
     tips = generate_portfolio_tips(valid, portfolio_symbols)
     st.markdown("### 💡 Sugestie dla Twojego portfela")
     for tip in tips:
         st.info(tip)
 
-    st.markdown("### 🔥 TOP 5 Najlepszych Okazji")
+    st.markdown("### 🔥 TOP 5 Najbardziej Niedoszacowanych Spółek")
     top5 = valid.head(5)
     top_cols = st.columns(5)
     for col, (_, row) in zip(top_cols, top5.iterrows()):
         with col:
-            st.metric(row["long_name"], f"{row['score']:.1f} / 10")
+            st.metric(row["long_name"], f"{row['score']:.0f} / 100", delta=row["classification"])
             st.caption(f"Ticker: {row['symbol']}")
-            st.caption(row["rationale"])
             currency_suffix = f" {row.get('currency', '')}" if row.get("currency") else ""
             price_txt = fmt_number(row.get("current_price"), 2, currency_suffix)
             target6_txt = fmt_number(row.get("target_6m_price"), 2)
@@ -1456,13 +1794,13 @@ def render_gpw_scanner_tab(portfolio: pd.DataFrame) -> None:
             st.write(f"**Target 12M:** {target12_txt} ({pct12_txt})")
             rec_txt = format_recommendation_text(row.get("recommendation"), row.get("num_analysts"))
             st.write(f"**Rekomendacja analityków:** {rec_txt}")
-            profile = {
-                "sector": row.get("sector"), "industry": row.get("industry"),
-                "revenue_growth": row.get("revenue_growth"), "earnings_growth": row.get("earnings_growth"),
-                "recommendation": row.get("recommendation"), "num_analysts": row.get("num_analysts"),
-            }
-            narrative = generate_company_narrative(profile, row["rationale"])
+            narrative = generate_holistic_narrative(row, {
+                "score": row["score"], "classification": row["classification"], "rationale": row["rationale"],
+            })
             st.caption(f"🗒️ {narrative}")
+            with st.expander("Rozbicie na 5 filarów"):
+                for pillar_name, pillar_val in row["pillar_scores"].items():
+                    st.write(f"**{pillar_name}:** {pillar_val:.1f} / 10")
 
     st.divider()
     st.markdown("### 🛡️ Stabilne Top Picks (niższe ryzyko, pewniejszy wzrost)")
@@ -1472,17 +1810,13 @@ def render_gpw_scanner_tab(portfolio: pd.DataFrame) -> None:
         "czyli 'wolniej, ale stabilniej'. To narzędzie analityczno-edukacyjne, NIE stanowi rekomendacji inwestycyjnej."
     )
 
-    stability_rows = [fetch_stability_metrics(sym) for sym in valid["symbol"]]
-    stab_df = pd.DataFrame(stability_rows).drop(columns=["revenue_growth", "earnings_growth"], errors="ignore")
-    valid_stab = valid.merge(stab_df, on="symbol", how="left")
-
-    stab_scored = valid_stab.apply(
+    stab_scored = valid.apply(
         lambda r: compute_stability_score(
             r.get("beta"), r.get("volatility_pct"), r.get("dividend_yield"), r.get("revenue_growth"), r.get("earnings_growth")
         ),
         axis=1, result_type="expand",
     )
-    valid_stab = pd.concat([valid_stab.reset_index(drop=True), stab_scored.reset_index(drop=True)], axis=1)
+    valid_stab = pd.concat([valid.reset_index(drop=True), stab_scored.reset_index(drop=True)], axis=1)
     valid_stab["stability_labels"] = valid_stab.apply(
         lambda r: compute_stability_status_labels(r.get("beta"), r.get("volatility_pct"), r.get("dividend_yield")), axis=1
     )
